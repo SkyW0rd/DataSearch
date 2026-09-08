@@ -4,10 +4,13 @@
 
 #include <zlib.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <utility>
+#include <vector>
 
 using datasearch::core::ContentExtractor;
 using datasearch::core::ExtractionOptions;
@@ -45,6 +48,92 @@ std::string zlibCompress(const std::string& input) {
     if (rc != Z_OK) throw std::runtime_error("zlibCompress failed");
     out.resize(boundLen);
     return out;
+}
+
+void putU16(std::string& out, std::uint16_t v) {
+    out.push_back(static_cast<char>(v & 0xFF));
+    out.push_back(static_cast<char>((v >> 8) & 0xFF));
+}
+
+void putU32(std::string& out, std::uint32_t v) {
+    out.push_back(static_cast<char>(v & 0xFF));
+    out.push_back(static_cast<char>((v >> 8) & 0xFF));
+    out.push_back(static_cast<char>((v >> 16) & 0xFF));
+    out.push_back(static_cast<char>((v >> 24) & 0xFF));
+}
+
+// Builds a minimal ZIP archive (stored/uncompressed entries) in-process, so
+// DOCX/XLSX test fixtures don't depend on an external `zip` binary — the
+// windows-latest GitHub Actions runner doesn't have one on PATH, unlike
+// macOS/Linux. CRC32 comes from zlib, already linked for FlateDecode above.
+void writeZip(const std::filesystem::path& zipPath,
+              const std::vector<std::pair<std::string, std::string>>& entries) {
+    struct CentralEntry {
+        std::string name;
+        std::uint32_t crc;
+        std::uint32_t size;
+        std::uint32_t offset;
+    };
+    std::string out;
+    std::vector<CentralEntry> central;
+
+    for (const auto& [name, content] : entries) {
+        const auto offset = static_cast<std::uint32_t>(out.size());
+        const auto crc = static_cast<std::uint32_t>(
+            crc32(0, reinterpret_cast<const Bytef*>(content.data()), static_cast<uInt>(content.size())));
+        const auto size = static_cast<std::uint32_t>(content.size());
+
+        putU32(out, 0x04034b50); // local file header signature
+        putU16(out, 20);         // version needed to extract
+        putU16(out, 0);          // flags
+        putU16(out, 0);          // method: stored
+        putU16(out, 0);          // mod time
+        putU16(out, 0);          // mod date
+        putU32(out, crc);
+        putU32(out, size); // compressed size
+        putU32(out, size); // uncompressed size
+        putU16(out, static_cast<std::uint16_t>(name.size()));
+        putU16(out, 0); // extra field length
+        out += name;
+        out += content;
+
+        central.push_back({name, crc, size, offset});
+    }
+
+    const auto cdStart = static_cast<std::uint32_t>(out.size());
+    for (const auto& e : central) {
+        putU32(out, 0x02014b50); // central directory header signature
+        putU16(out, 20);         // version made by
+        putU16(out, 20);         // version needed to extract
+        putU16(out, 0);          // flags
+        putU16(out, 0);          // method: stored
+        putU16(out, 0);          // mod time
+        putU16(out, 0);          // mod date
+        putU32(out, e.crc);
+        putU32(out, e.size); // compressed size
+        putU32(out, e.size); // uncompressed size
+        putU16(out, static_cast<std::uint16_t>(e.name.size()));
+        putU16(out, 0); // extra field length
+        putU16(out, 0); // comment length
+        putU16(out, 0); // disk number start
+        putU16(out, 0); // internal attributes
+        putU32(out, 0); // external attributes
+        putU32(out, e.offset);
+        out += e.name;
+    }
+    const auto cdSize = static_cast<std::uint32_t>(out.size() - cdStart);
+
+    putU32(out, 0x06054b50); // end of central directory signature
+    putU16(out, 0);          // disk number
+    putU16(out, 0);          // disk with central directory
+    putU16(out, static_cast<std::uint16_t>(central.size()));
+    putU16(out, static_cast<std::uint16_t>(central.size()));
+    putU32(out, cdSize);
+    putU32(out, cdStart);
+    putU16(out, 0); // comment length
+
+    std::ofstream file(zipPath, std::ios::binary);
+    file.write(out.data(), static_cast<std::streamsize>(out.size()));
 }
 
 } // namespace
@@ -86,21 +175,18 @@ void runContentExtractorTests() {
     DS_CHECK(!ContentExtractor::isSupportedExtension(".exe"));
     DS_CHECK(!ContentExtractor::isSupportedExtension(".png"));
 
-    // --- DOCX (real ZIP container built with the system `zip` tool) -------
+    // --- DOCX (real ZIP container, built in-process — see writeZip) -------
     {
-        const auto docxDir = root / "docx_src";
-        writeFile(docxDir / "word" / "document.xml",
-                  "<?xml version=\"1.0\"?>"
-                  "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
-                  "<w:body>"
-                  "<w:p><w:r><w:t>Hello world</w:t></w:r></w:p>"
-                  "<w:p><w:r><w:t>\xd0\x92\xd1\x82\xd0\xbe\xd1\x80\xd0\xbe\xd0\xb9 "
-                  "\xd0\xb0\xd0\xb1\xd0\xb7\xd0\xb0\xd1\x86</w:t></w:r></w:p>"
-                  "</w:body></w:document>");
+        const std::string documentXml =
+            "<?xml version=\"1.0\"?>"
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+            "<w:body>"
+            "<w:p><w:r><w:t>Hello world</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>\xd0\x92\xd1\x82\xd0\xbe\xd1\x80\xd0\xbe\xd0\xb9 "
+            "\xd0\xb0\xd0\xb1\xd0\xb7\xd0\xb0\xd1\x86</w:t></w:r></w:p>"
+            "</w:body></w:document>";
         const auto docxPath = root / "report.docx";
-        const std::string cmd = "cd " + docxDir.string() + " && zip -q -X " + docxPath.string() +
-                                 " word/document.xml";
-        DS_CHECK_EQ(std::system(cmd.c_str()), 0);
+        writeZip(docxPath, {{"word/document.xml", documentXml}});
 
         auto extracted = ContentExtractor::extract(docxPath, ".docx");
         DS_CHECK(extracted.has_value());
@@ -112,24 +198,22 @@ void runContentExtractorTests() {
 
     // --- XLSX (shared strings + inline string cell) ------------------------
     {
-        const auto xlsxDir = root / "xlsx_src";
-        writeFile(xlsxDir / "xl" / "sharedStrings.xml",
-                  "<?xml version=\"1.0\"?>"
-                  "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
-                  "count=\"2\" uniqueCount=\"2\">"
-                  "<si><t>Apple</t></si>"
-                  "<si><t>\xd0\x91\xd0\xb0\xd0\xbd\xd0\xb0\xd0\xbd</t></si>"
-                  "</sst>");
-        writeFile(xlsxDir / "xl" / "worksheets" / "sheet1.xml",
-                  "<?xml version=\"1.0\"?>"
-                  "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
-                  "<sheetData>"
-                  "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\" t=\"s\"><v>1</v></c></row>"
-                  "<row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>Extra note</t></is></c></row>"
-                  "</sheetData></worksheet>");
+        const std::string sharedStrings =
+            "<?xml version=\"1.0\"?>"
+            "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+            "count=\"2\" uniqueCount=\"2\">"
+            "<si><t>Apple</t></si>"
+            "<si><t>\xd0\x91\xd0\xb0\xd0\xbd\xd0\xb0\xd0\xbd</t></si>"
+            "</sst>";
+        const std::string sheet1 =
+            "<?xml version=\"1.0\"?>"
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+            "<sheetData>"
+            "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\" t=\"s\"><v>1</v></c></row>"
+            "<row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>Extra note</t></is></c></row>"
+            "</sheetData></worksheet>";
         const auto xlsxPath = root / "book.xlsx";
-        const std::string cmd = "cd " + xlsxDir.string() + " && zip -q -X -r " + xlsxPath.string() + " xl";
-        DS_CHECK_EQ(std::system(cmd.c_str()), 0);
+        writeZip(xlsxPath, {{"xl/sharedStrings.xml", sharedStrings}, {"xl/worksheets/sheet1.xml", sheet1}});
 
         auto extracted = ContentExtractor::extract(xlsxPath, ".xlsx");
         DS_CHECK(extracted.has_value());
