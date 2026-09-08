@@ -55,6 +55,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     auto* searchLayout = new QHBoxLayout();
     searchEdit_ = new QLineEdit(central);
     searchEdit_->setPlaceholderText(tr("Поиск по имени и содержимому файлов..."));
+    searchEdit_->setToolTip(tr("Операторы: \"точная фраза\", -исключить, ext:docx, path:D:\\Work\\"));
     indexButton_ = new QPushButton(tr("Индексировать выбранные"), central);
     searchLayout->addWidget(searchEdit_, 1);
     searchLayout->addWidget(indexButton_);
@@ -109,6 +110,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             &MainWindow::onResultsContextMenuRequested);
     connect(resultsView_, &QTableView::doubleClicked, this, &MainWindow::onResultDoubleClicked);
     connect(indexManager_, &IndexManager::watcherActivity, this, &MainWindow::onWatcherActivity);
+    connect(indexManager_, &IndexManager::sourceUnavailable, this, &MainWindow::onSourceUnavailable);
     connect(excludeMasksEdit_, &QLineEdit::editingFinished, this, &MainWindow::onExcludeMasksEdited);
 
     {
@@ -297,6 +299,14 @@ void MainWindow::copyRowPath(int row) {
 
 void MainWindow::onWatcherActivity(const QString& rootLabel, const QString& description) {
     statusLabel_->setText(QString("%1: %2").arg(rootLabel, description));
+}
+
+void MainWindow::onSourceUnavailable(const QString& rootLabel) {
+    // ТЗ п.11.4: source (e.g. a disconnected network drive) is unreachable
+    // right now — its existing index is untouched and still searchable, this
+    // is just a notice that results may be stale until it's back.
+    statusLabel_->setText(
+        tr("%1: диск недоступен, показаны данные последней индексации").arg(rootLabel));
 }
 
 std::vector<std::string> MainWindow::parseExcludeMasks() const {

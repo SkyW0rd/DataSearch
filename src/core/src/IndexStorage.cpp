@@ -1,6 +1,7 @@
 #include "datasearch/core/IndexStorage.h"
 
 #include "datasearch/core/Fts5RussianTokenizer.h"
+#include "datasearch/core/SearchQueryParser.h"
 
 #include <sqlite3.h>
 
@@ -80,19 +81,40 @@ const char* sortColumnFts(SortField field) {
     }
 }
 
-// Wraps `pattern` as a single quoted FTS5 phrase with a trailing prefix
-// wildcard (e.g. практик -> "практик"*), so arbitrary user text (spaces,
-// punctuation) is always a well-formed MATCH expression, while still
-// supporting partial/prefix matches (ТЗ FR-10). Operators like ext:/path:/
-// quoted phrases/minus-words (ТЗ FR-13) are a later stage, not this one.
-std::string buildMatchExpression(const std::string& pattern) {
+std::string escapeFtsQuoted(const std::string& text) {
     std::string escaped;
-    escaped.reserve(pattern.size() + 2);
-    for (char c : pattern) {
+    escaped.reserve(text.size() + 2);
+    for (char c : text) {
         if (c == '"') escaped += "\"\"";
         else escaped += c;
     }
-    return "\"" + escaped + "\"*";
+    return escaped;
+}
+
+// Builds an FTS5 MATCH expression ANDing every token: barewords become
+// prefix-matched quoted phrases (практик -> "практик"*, ТЗ FR-10), tokens
+// from "double quotes" in the original query become exact quoted phrases
+// with no prefix wildcard (ТЗ FR-13). Assumes `tokens` is non-empty.
+std::string buildMatchExpression(const std::vector<ParsedSearchQuery::Token>& tokens) {
+    std::string expr;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (i > 0) expr += " AND ";
+        expr += "\"";
+        expr += escapeFtsQuoted(tokens[i].text);
+        expr += "\"";
+        if (!tokens[i].isPhrase) expr += "*";
+    }
+    return expr;
+}
+
+std::string escapeLikePattern(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        if (c == '%' || c == '_' || c == '\\') out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
 }
 
 FileRecord readRow(sqlite3_stmt* stmt, bool hasSnippet) {
@@ -250,39 +272,85 @@ std::vector<FileRecord> IndexStorage::search(const SearchQuery& query) const {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<FileRecord> results;
 
-    if (query.namePattern.empty()) {
-        std::string sql = "SELECT path, name, ext, size, created_time, modified_time FROM files ORDER BY ";
-        sql += sortColumnPlain(query.sortField);
+    // ТЗ FR-13: точная фраза в кавычках, исключение через "-", ext:/path: —
+    // parsed once here so both the FTS5 and the plain "browse all" paths
+    // below can honor the same filters consistently.
+    const ParsedSearchQuery parsed = parseSearchQuery(query.namePattern);
+    std::vector<ParsedSearchQuery::Token> positive;
+    std::vector<ParsedSearchQuery::Token> negative;
+    for (const auto& token : parsed.tokens) {
+        (token.excluded ? negative : positive).push_back(token);
+    }
+
+    const std::string positiveExpr = positive.empty() ? std::string() : buildMatchExpression(positive);
+    const std::string negativeExpr = negative.empty() ? std::string() : buildMatchExpression(negative);
+    const std::string likePattern =
+        parsed.pathFilter ? "%" + escapeLikePattern(*parsed.pathFilter) + "%" : std::string();
+
+    std::vector<std::string> extraWhere;
+    if (!negativeExpr.empty()) extraWhere.push_back("f.id NOT IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)");
+    if (parsed.extensionFilter) extraWhere.push_back("LOWER(f.ext) = ?");
+    if (parsed.pathFilter) extraWhere.push_back("f.path LIKE ? ESCAPE '\\'");
+
+    auto bindExtras = [&](Statement& stmt, int& idx) {
+        if (!negativeExpr.empty()) sqlite3_bind_text(stmt, idx++, negativeExpr.c_str(), -1, SQLITE_TRANSIENT);
+        if (parsed.extensionFilter) sqlite3_bind_text(stmt, idx++, parsed.extensionFilter->c_str(), -1, SQLITE_TRANSIENT);
+        if (parsed.pathFilter) sqlite3_bind_text(stmt, idx++, likePattern.c_str(), -1, SQLITE_TRANSIENT);
+    };
+
+    if (!positiveExpr.empty()) {
+        std::string sql =
+            "SELECT f.path, f.name, f.ext, f.size, f.created_time, f.modified_time, "
+            "       snippet(files_fts, 1, '[', ']', '...', 12), "
+            "       bm25(files_fts, 10.0, 1.0) "
+            "FROM files_fts JOIN files f ON f.id = files_fts.rowid "
+            "WHERE files_fts MATCH ?";
+        for (const auto& clause : extraWhere) {
+            sql += " AND ";
+            sql += clause;
+        }
+        sql += " ORDER BY ";
+        sql += sortColumnFts(query.sortField);
         sql += query.sortOrder == SortOrder::Descending ? " DESC" : " ASC";
-        sql += " LIMIT ?1 OFFSET ?2;";
+        sql += " LIMIT ? OFFSET ?;";
 
         Statement stmt(db_, sql.c_str());
-        sqlite3_bind_int(stmt, 1, query.limit);
-        sqlite3_bind_int(stmt, 2, query.offset);
+        int idx = 1;
+        sqlite3_bind_text(stmt, idx++, positiveExpr.c_str(), -1, SQLITE_TRANSIENT);
+        bindExtras(stmt, idx);
+        sqlite3_bind_int(stmt, idx++, query.limit);
+        sqlite3_bind_int(stmt, idx++, query.offset);
+
         while (sqlite3_step(stmt) == SQLITE_ROW) {
-            results.push_back(readRow(stmt, /*hasSnippet=*/false));
+            results.push_back(readRow(stmt, /*hasSnippet=*/true));
         }
         return results;
     }
 
-    std::string sql =
-        "SELECT f.path, f.name, f.ext, f.size, f.created_time, f.modified_time, "
-        "       snippet(files_fts, 1, '[', ']', '...', 12), "
-        "       bm25(files_fts, 10.0, 1.0) "
-        "FROM files_fts JOIN files f ON f.id = files_fts.rowid "
-        "WHERE files_fts MATCH ?1 ORDER BY ";
-    sql += sortColumnFts(query.sortField);
+    // No positive full-text terms (browsing all, or only -exclusions/ext:/path:
+    // filters): plain scan over `files`, still honoring whichever filters
+    // were given.
+    std::string sql = "SELECT path, name, ext, size, created_time, modified_time FROM files f";
+    if (!extraWhere.empty()) {
+        sql += " WHERE ";
+        for (std::size_t i = 0; i < extraWhere.size(); ++i) {
+            if (i > 0) sql += " AND ";
+            sql += extraWhere[i];
+        }
+    }
+    sql += " ORDER BY ";
+    sql += sortColumnPlain(query.sortField);
     sql += query.sortOrder == SortOrder::Descending ? " DESC" : " ASC";
-    sql += " LIMIT ?2 OFFSET ?3;";
+    sql += " LIMIT ? OFFSET ?;";
 
     Statement stmt(db_, sql.c_str());
-    const std::string matchExpr = buildMatchExpression(query.namePattern);
-    sqlite3_bind_text(stmt, 1, matchExpr.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 2, query.limit);
-    sqlite3_bind_int(stmt, 3, query.offset);
+    int idx = 1;
+    bindExtras(stmt, idx);
+    sqlite3_bind_int(stmt, idx++, query.limit);
+    sqlite3_bind_int(stmt, idx++, query.offset);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        results.push_back(readRow(stmt, /*hasSnippet=*/true));
+        results.push_back(readRow(stmt, /*hasSnippet=*/false));
     }
     return results;
 }

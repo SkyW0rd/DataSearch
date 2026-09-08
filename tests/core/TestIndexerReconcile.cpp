@@ -84,3 +84,37 @@ void runIndexerReconcileTests() {
     indexer.join();
     DS_CHECK_EQ(storage.fileCount(), std::uint64_t{2});
 }
+
+void runIndexerUnavailableRootTests() {
+    const auto root = makeScratchDir();
+    struct Cleanup {
+        std::filesystem::path p;
+        ~Cleanup() { std::filesystem::remove_all(p); }
+    } cleanup{root};
+
+    writeFileAt(root / "a.txt", "hello", std::filesystem::file_time_type::clock::now());
+    writeFileAt(root / "b.txt", "world", std::filesystem::file_time_type::clock::now());
+
+    IndexStorage storage(":memory:");
+    Indexer indexer(storage);
+    indexer.start({root});
+    indexer.join();
+    DS_CHECK_EQ(storage.fileCount(), std::uint64_t{2});
+
+    // Simulate the source becoming unreachable (ТЗ п.11.4, e.g. a
+    // disconnected network drive) by reconciling against a path that
+    // doesn't currently resolve to a directory.
+    bool unavailableReported = false;
+    IndexerOptions options;
+    options.onRootUnavailable = [&](const std::filesystem::path&) { unavailableReported = true; };
+    Indexer reconciler(storage, {}, {}, options);
+    reconciler.startReconcile({root / "does_not_exist_anymore"});
+    reconciler.join();
+
+    DS_CHECK(unavailableReported);
+    // The existing index must be left untouched — not wiped just because the
+    // source looked unreachable/empty this time.
+    DS_CHECK_EQ(storage.fileCount(), std::uint64_t{2});
+    auto all = storage.allRecords();
+    DS_CHECK_EQ(all.size(), std::size_t{2});
+}

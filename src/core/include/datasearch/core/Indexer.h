@@ -32,6 +32,13 @@ struct IndexerOptions {
     // THREAD_PRIORITY_BELOW_NORMAL, ТЗ п.12.3) without core depending on
     // platform directly.
     std::function<void()> onWorkerThreadStart;
+
+    // Called (on a worker thread) for a root that FileScanner::isAccessible()
+    // finds unreachable (e.g. a disconnected network drive, ТЗ п.11.4) before
+    // any scanning is attempted for it. That root is then skipped entirely —
+    // in reconcile mode in particular, its previously-indexed files are left
+    // untouched rather than being treated as deleted.
+    std::function<void(const std::filesystem::path&)> onRootUnavailable;
 };
 
 // Runs scans of one or more roots on a background thread pool and writes the

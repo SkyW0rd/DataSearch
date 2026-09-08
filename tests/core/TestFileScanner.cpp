@@ -80,4 +80,10 @@ void runFileScannerTests() {
 
     DS_CHECK(!FileScanner::statFile(root / "does_not_exist.txt", options).has_value());
     DS_CHECK(!FileScanner::statFile(root / "skip.tmp", options).has_value());  // excluded by mask
+
+    // isAccessible: used to detect a temporarily unreachable source
+    // (ТЗ п.11.4) before treating "nothing found" as "everything deleted".
+    DS_CHECK(FileScanner::isAccessible(root));
+    DS_CHECK(!FileScanner::isAccessible(root / "does_not_exist_dir"));
+    DS_CHECK(!FileScanner::isAccessible(root / "alpha.txt"));  // a file, not a directory
 }

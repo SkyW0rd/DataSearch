@@ -16,8 +16,10 @@ enum class SortField { Relevance, Name, ModifiedTime, Size };
 enum class SortOrder { Ascending, Descending };
 
 struct SearchQuery {
-    // Substring/prefix match against name+content (FTS5 MATCH, ТЗ FR-10/FR-11);
-    // empty means "browse all files" (no ranking, just the plain file list).
+    // Raw search-box text, parsed internally (see SearchQueryParser.h) for
+    // ТЗ FR-13 operators: "exact phrase", -excluded, ext:docx, path:D:\Work\,
+    // plus plain barewords (prefix-matched substring, ТЗ FR-10/FR-11). Empty
+    // means "browse all files" (no ranking, just the plain file list).
     std::string namePattern;
     SortField sortField = SortField::Relevance;
     SortOrder sortOrder = SortOrder::Ascending;

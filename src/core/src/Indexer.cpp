@@ -105,6 +105,7 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
 
     std::atomic<std::size_t> nextRootIndex{0};
     std::atomic<std::uint64_t> filesIndexed{0};
+    std::atomic<bool> anyRootUnavailable{false};
 
     const std::size_t threadCount = std::max<std::size_t>(
         1, std::min(roots.empty() ? std::size_t{1} : roots.size(),
@@ -116,6 +117,15 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
         while (!cancelled_.load(std::memory_order_relaxed)) {
             const std::size_t idx = nextRootIndex.fetch_add(1, std::memory_order_relaxed);
             if (idx >= roots.size()) break;
+
+            // A temporarily unreachable source (ТЗ п.11.4, e.g. a
+            // disconnected network drive) must not be treated as "every
+            // indexed file was deleted" — skip it untouched instead.
+            if (!FileScanner::isAccessible(roots[idx])) {
+                anyRootUnavailable.store(true, std::memory_order_relaxed);
+                if (indexerOptions_.onRootUnavailable) indexerOptions_.onRootUnavailable(roots[idx]);
+                continue;
+            }
 
             FileScanner::scan(
                 roots[idx], scanOptions_,
@@ -158,10 +168,14 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
     for (std::size_t i = 0; i < threadCount; ++i) workers.emplace_back(worker);
     for (auto& t : workers) t.join();
 
-    if (reconcileMode && !cancelled_.load(std::memory_order_relaxed)) {
+    if (reconcileMode && !cancelled_.load(std::memory_order_relaxed) &&
+        !anyRootUnavailable.load(std::memory_order_relaxed)) {
         // Anything still indexed but never visited on this pass no longer
         // exists on disk (ТЗ п.13.2: "путь есть в индексе, но физически
-        // отсутствует на диске -> запись удаляется").
+        // отсутствует на диске -> запись удаляется"). Skipped entirely if any
+        // root was unreachable this pass — we can't tell which existing
+        // records belong to the unavailable root, so it's safer to remove
+        // nothing than to wrongly wipe files that are simply offline.
         for (const auto& [path, stat] : existingByPath) {
             (void)stat;
             if (visitedPaths.find(path) == visitedPaths.end()) {

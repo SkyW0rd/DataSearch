@@ -6,11 +6,14 @@
 void runFileScannerTests();
 void runIndexStorageTests();
 void runIndexStorageContentSearchTests();
+void runIndexStorageQueryOperatorTests();
 void runSearchEngineTests();
 void runRussianStemmerTests();
 void runContentExtractorTests();
 void runSourceRegistryTests();
 void runIndexerReconcileTests();
+void runIndexerUnavailableRootTests();
+void runSearchQueryParserTests();
 
 namespace {
 
@@ -26,11 +29,14 @@ int main() {
         {"FileScanner", runFileScannerTests},
         {"IndexStorage", runIndexStorageTests},
         {"IndexStorageContentSearch", runIndexStorageContentSearchTests},
+        {"IndexStorageQueryOperators", runIndexStorageQueryOperatorTests},
         {"SearchEngine", runSearchEngineTests},
         {"RussianStemmer", runRussianStemmerTests},
         {"ContentExtractor", runContentExtractorTests},
         {"SourceRegistry", runSourceRegistryTests},
         {"IndexerReconcile", runIndexerReconcileTests},
+        {"IndexerUnavailableRoot", runIndexerUnavailableRootTests},
+        {"SearchQueryParser", runSearchQueryParserTests},
     };
 
     int failures = 0;

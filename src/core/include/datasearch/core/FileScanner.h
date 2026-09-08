@@ -45,6 +45,12 @@ public:
     // mask in `options` (by filename, same rule as scan()).
     static std::optional<FileRecord> statFile(const std::filesystem::path& path,
                                                const ScanOptions& options = {});
+
+    // Whether `root` currently resolves to an accessible directory. Used
+    // before scanning/reconciling a source so a temporarily unreachable
+    // network drive (ТЗ п.11.4: "диск недоступен") doesn't get treated as
+    // "every indexed file was deleted" — see Indexer.
+    static bool isAccessible(const std::filesystem::path& root);
 };
 
 } // namespace datasearch::core

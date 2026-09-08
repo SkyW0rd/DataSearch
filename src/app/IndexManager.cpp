@@ -117,6 +117,9 @@ IndexerOptions IndexManager::makeIndexerOptions() const {
             // Best-effort (ТЗ п.12.3): indexing still works at normal priority.
         }
     };
+    options.onRootUnavailable = [this](const std::filesystem::path& root) {
+        emit sourceUnavailable(QString::fromStdString(datasearch::core::pathToUtf8(root)));
+    };
     return options;
 }
 

@@ -36,6 +36,7 @@ private slots:
     void onResultsContextMenuRequested(const QPoint& pos);
     void onResultDoubleClicked(const QModelIndex& index);
     void onWatcherActivity(const QString& rootLabel, const QString& description);
+    void onSourceUnavailable(const QString& rootLabel);
     void onExcludeMasksEdited();
 
 private:

@@ -69,6 +69,10 @@ signals:
     void progress(quint64 filesIndexed, QString currentPath, QString rootLabel);
     void finished(QString rootLabel, bool cancelled);
     void watcherActivity(QString rootLabel, QString description);
+    // A source was temporarily unreachable during a scan/reconcile (ТЗ
+    // п.11.4, e.g. a disconnected network drive) — its existing index was
+    // left untouched and still serves search results.
+    void sourceUnavailable(QString rootLabel);
 
 signals:
     // Internal: marshals a watcher callback (fires on the watch's own

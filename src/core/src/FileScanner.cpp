@@ -164,4 +164,10 @@ std::optional<FileRecord> FileScanner::statFile(const std::filesystem::path& pat
     return record;
 }
 
+bool FileScanner::isAccessible(const std::filesystem::path& root) {
+    std::error_code ec;
+    const bool isDir = std::filesystem::is_directory(root, ec);
+    return !ec && isDir;
+}
+
 } // namespace datasearch::core

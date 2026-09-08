@@ -127,3 +127,101 @@ void runIndexStorageContentSearchTests() {
     DS_CHECK_EQ(englishResults.size(), std::size_t{1});
     DS_CHECK_EQ(englishResults[0].path, other.path);
 }
+
+void runIndexStorageQueryOperatorTests() {
+    IndexStorage storage(":memory:");
+
+    FileRecord report;
+    report.path = "D:\\Work\\report.docx";
+    report.name = "report.docx";
+    report.extension = ".docx";
+    report.size = 10;
+    report.modifiedTime = 1;
+    storage.upsertFile(report, "quarterly report draft");
+
+    FileRecord finalReport;
+    finalReport.path = "D:\\Work\\final.docx";
+    finalReport.name = "final.docx";
+    finalReport.extension = ".docx";
+    finalReport.size = 20;
+    finalReport.modifiedTime = 2;
+    storage.upsertFile(finalReport, "quarterly report final version");
+
+    FileRecord otherExt;
+    otherExt.path = "D:\\Work\\report.pdf";
+    otherExt.name = "report.pdf";
+    otherExt.extension = ".pdf";
+    otherExt.size = 30;
+    otherExt.modifiedTime = 3;
+    storage.upsertFile(otherExt, "quarterly report");
+
+    FileRecord elsewhere;
+    elsewhere.path = "D:\\Personal\\report.docx";
+    elsewhere.name = "report.docx";
+    elsewhere.extension = ".docx";
+    elsewhere.size = 5;
+    elsewhere.modifiedTime = 4;
+    storage.upsertFile(elsewhere, "quarterly report");
+
+    DS_CHECK_EQ(storage.fileCount(), std::uint64_t{4});
+
+    // -exclusion: "quarterly" matches all four, "-draft" removes report.docx.
+    {
+        SearchQuery q;
+        q.namePattern = "quarterly -draft";
+        q.limit = 10;
+        auto results = storage.search(q);
+        DS_CHECK_EQ(results.size(), std::size_t{3});
+        for (const auto& r : results) DS_CHECK(r.path != report.path);
+    }
+
+    // ext: filter combined with free text.
+    {
+        SearchQuery q;
+        q.namePattern = "quarterly ext:pdf";
+        q.limit = 10;
+        auto results = storage.search(q);
+        DS_CHECK_EQ(results.size(), std::size_t{1});
+        DS_CHECK_EQ(results[0].path, otherExt.path);
+    }
+
+    // path: filter (substring, case-insensitive) combined with free text.
+    {
+        SearchQuery q;
+        q.namePattern = "quarterly path:d:\\work";
+        q.limit = 10;
+        auto results = storage.search(q);
+        DS_CHECK_EQ(results.size(), std::size_t{3});
+        for (const auto& r : results) DS_CHECK(r.path != elsewhere.path);
+    }
+
+    // Exact phrase: "report final" matches finalReport's content, not the others.
+    {
+        SearchQuery q;
+        q.namePattern = "\"report final\"";
+        q.limit = 10;
+        auto results = storage.search(q);
+        DS_CHECK_EQ(results.size(), std::size_t{1});
+        DS_CHECK_EQ(results[0].path, finalReport.path);
+    }
+
+    // ext: alone (no free text) still filters via the plain browse-all path.
+    {
+        SearchQuery q;
+        q.namePattern = "ext:pdf";
+        q.limit = 10;
+        auto results = storage.search(q);
+        DS_CHECK_EQ(results.size(), std::size_t{1});
+        DS_CHECK_EQ(results[0].path, otherExt.path);
+    }
+
+    // -exclusion alone (no positive text) still filters via the browse-all path.
+    {
+        SearchQuery q;
+        q.namePattern = "-draft";
+        q.limit = 10;
+        auto results = storage.search(q);
+        DS_CHECK_EQ(results.size(), std::size_t{3});
+        for (const auto& r : results) DS_CHECK(r.path != report.path);
+    }
+}
