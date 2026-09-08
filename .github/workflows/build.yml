@@ -85,6 +85,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist_payload
           Copy-Item build/src/app/Release/datasearch_app.exe dist_payload/
+          # vcpkg's applocal deps step (VCPKG_APPLOCAL_DEPS, on by default)
+          # already dropped sqlite3.dll/z.dll etc. next to the exe at build
+          # time -- windeployqt only knows about Qt's own dependencies, so
+          # these have to be copied across separately or the packaged app
+          # fails to launch with "sqlite3.dll not found".
+          Copy-Item build/src/app/Release/*.dll dist_payload/
           & "$env:QT_ROOT_DIR/bin/windeployqt.exe" dist_payload/datasearch_app.exe
           New-Item -ItemType Directory -Path dist
           Compress-Archive -Path dist_payload/* -DestinationPath "dist/${{ matrix.artifact }}.zip"
