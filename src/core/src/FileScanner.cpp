@@ -49,7 +49,7 @@ bool matchesAnyMask(const std::vector<std::string>& masks, const std::string& na
 
 std::int64_t toEpochSeconds(std::filesystem::file_time_type ftime) {
     using namespace std::chrono;
-    const auto sctp = std::filesystem::file_time_type::clock::to_sys(ftime);
+    const auto sctp = std::chrono::file_clock::to_sys(ftime);
     return static_cast<std::int64_t>(duration_cast<seconds>(sctp.time_since_epoch()).count());
 }
 
