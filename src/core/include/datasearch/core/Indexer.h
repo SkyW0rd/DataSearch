@@ -5,9 +5,12 @@
 #include "datasearch/core/IndexStorage.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,6 +29,18 @@ struct IndexerOptions {
     // Background-indexing parallelism cap (ТЗ п.12.3: "не более
     // количество_ядер/2, не менее 1 и не более 4"). 0 = pick that default.
     std::size_t threadCount = 0;
+
+    // Records written per SQLite commit. Smaller values commit (and release
+    // the batch's in-memory statement/WAL state) more often, trading some
+    // throughput for a lower peak memory footprint — the "сброс буферов на
+    // диск" behaviour ТЗ п.12.3 asks for under a constrained RAM budget.
+    // 0 = use the built-in default (500).
+    std::uint64_t batchSize = 0;
+
+    // Pause briefly after each file (ТЗ п.12.3: "trottling между файлами...
+    // особенно на HDD"), so background indexing doesn't saturate disk I/O
+    // the user's foreground work also needs. 0 (default) = no throttling.
+    std::chrono::milliseconds ioDelayPerFile{0};
 
     // Called once at the start of each indexing worker thread, so the
     // platform layer can lower its OS thread priority (Windows:
@@ -78,22 +93,35 @@ public:
     // Requests the running scan to stop at the next visited entry. Does not block.
     void cancel();
 
+    // Temporarily stops processing new files (ТЗ п.12.3 UI: "поставить
+    // индексацию на паузу", e.g. so the user can reclaim CPU/disk for a game
+    // or render). The file currently being processed finishes normally;
+    // scanning resumes exactly where it left off — unlike cancel(), nothing
+    // is lost. Does not block.
+    void pause();
+    void resume();
+    bool isPaused() const;
+
     // Blocks until the background thread finishes (a no-op if none is running).
     void join();
 
     bool isRunning() const;
 
 private:
-    static constexpr std::uint64_t kBatchSize = 500;
+    static constexpr std::uint64_t kDefaultBatchSize = 500;
 
     IndexStorage& storage_;
     ScanOptions scanOptions_;
     ExtractionOptions extractionOptions_;
     IndexerOptions indexerOptions_;
     std::atomic<bool> cancelled_{false};
+    std::atomic<bool> paused_{false};
     std::atomic<bool> running_{false};
+    std::mutex pauseMutex_;
+    std::condition_variable pauseCv_;
     std::thread worker_;
 
+    void waitWhilePaused();
     void runInternal(std::vector<std::filesystem::path> roots,
                       ProgressCallback onProgress,
                       CompletionCallback onComplete,

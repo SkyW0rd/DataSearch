@@ -66,6 +66,28 @@ void Indexer::startReconcile(std::vector<std::filesystem::path> roots,
 
 void Indexer::cancel() {
     cancelled_.store(true, std::memory_order_relaxed);
+    pauseCv_.notify_all();  // don't leave a paused run stuck waiting forever
+}
+
+void Indexer::pause() {
+    paused_.store(true, std::memory_order_relaxed);
+}
+
+void Indexer::resume() {
+    paused_.store(false, std::memory_order_relaxed);
+    pauseCv_.notify_all();
+}
+
+bool Indexer::isPaused() const {
+    return paused_.load(std::memory_order_relaxed);
+}
+
+void Indexer::waitWhilePaused() {
+    if (!paused_.load(std::memory_order_relaxed)) return;
+    std::unique_lock<std::mutex> lock(pauseMutex_);
+    pauseCv_.wait(lock, [this] {
+        return !paused_.load(std::memory_order_relaxed) || cancelled_.load(std::memory_order_relaxed);
+    });
 }
 
 void Indexer::join() {
@@ -110,6 +132,8 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
     const std::size_t threadCount = std::max<std::size_t>(
         1, std::min(roots.empty() ? std::size_t{1} : roots.size(),
                      indexerOptions_.threadCount == 0 ? defaultThreadCount() : indexerOptions_.threadCount));
+    const std::uint64_t effectiveBatchSize =
+        indexerOptions_.batchSize == 0 ? kDefaultBatchSize : indexerOptions_.batchSize;
 
     auto worker = [&]() {
         if (indexerOptions_.onWorkerThreadStart) indexerOptions_.onWorkerThreadStart();
@@ -130,6 +154,9 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
             FileScanner::scan(
                 roots[idx], scanOptions_,
                 [&](const FileRecord& record) {
+                    waitWhilePaused();
+                    if (cancelled_.load(std::memory_order_relaxed)) return;
+
                     if (reconcileMode) {
                         {
                             std::lock_guard<std::mutex> lock(visitedPathsMutex);
@@ -153,11 +180,14 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
 
                     storage_.upsertFile(record, content);
                     const std::uint64_t countSnapshot = filesIndexed.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (countSnapshot % kBatchSize == 0) {
+                    if (countSnapshot % effectiveBatchSize == 0) {
                         storage_.commitBatch();
                         storage_.beginBatch();
                     }
                     if (onProgress) onProgress(IndexProgress{countSnapshot, record.path});
+                    if (indexerOptions_.ioDelayPerFile.count() > 0) {
+                        std::this_thread::sleep_for(indexerOptions_.ioDelayPerFile);
+                    }
                 },
                 &cancelled_);
         }

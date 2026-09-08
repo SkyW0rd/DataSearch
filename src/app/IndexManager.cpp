@@ -145,6 +145,31 @@ std::vector<std::string> IndexManager::knownRoots() const {
     return roots;
 }
 
+void IndexManager::pauseAllIndexing() {
+    std::lock_guard<std::mutex> lock(mapsMutex_);
+    for (auto& [root, indexer] : indexers_) {
+        (void)root;
+        indexer->pause();
+    }
+}
+
+void IndexManager::resumeAllIndexing() {
+    std::lock_guard<std::mutex> lock(mapsMutex_);
+    for (auto& [root, indexer] : indexers_) {
+        (void)root;
+        indexer->resume();
+    }
+}
+
+bool IndexManager::isAnyIndexingPaused() const {
+    std::lock_guard<std::mutex> lock(mapsMutex_);
+    for (const auto& [root, indexer] : indexers_) {
+        (void)root;
+        if (indexer->isRunning() && indexer->isPaused()) return true;
+    }
+    return false;
+}
+
 void IndexManager::loadKnownSources() {
     for (const auto& entry : registry_->all()) {
         try {

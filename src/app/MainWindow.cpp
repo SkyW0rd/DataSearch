@@ -57,8 +57,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     searchEdit_->setPlaceholderText(tr("Поиск по имени и содержимому файлов..."));
     searchEdit_->setToolTip(tr("Операторы: \"точная фраза\", -исключить, ext:docx, path:D:\\Work\\"));
     indexButton_ = new QPushButton(tr("Индексировать выбранные"), central);
+    pauseResumeButton_ = new QPushButton(tr("Пауза"), central);
     searchLayout->addWidget(searchEdit_, 1);
     searchLayout->addWidget(indexButton_);
+    searchLayout->addWidget(pauseResumeButton_);
     rootLayout->addLayout(searchLayout);
 
     auto* settingsLayout = new QHBoxLayout();
@@ -111,6 +113,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(resultsView_, &QTableView::doubleClicked, this, &MainWindow::onResultDoubleClicked);
     connect(indexManager_, &IndexManager::watcherActivity, this, &MainWindow::onWatcherActivity);
     connect(indexManager_, &IndexManager::sourceUnavailable, this, &MainWindow::onSourceUnavailable);
+    connect(pauseResumeButton_, &QPushButton::clicked, this, &MainWindow::onPauseResumeClicked);
     connect(excludeMasksEdit_, &QLineEdit::editingFinished, this, &MainWindow::onExcludeMasksEdited);
 
     {
@@ -244,6 +247,11 @@ void MainWindow::onIndexFinished(const QString& rootLabel, bool cancelled) {
     progressBar_->setVisible(false);
     statusLabel_->setText(cancelled ? tr("%1: индексация отменена").arg(rootLabel)
                                      : tr("%1: индексация завершена").arg(rootLabel));
+    // Avoid a stale "Продолжить" label if this run ended (e.g. cancelled)
+    // while paused and nothing else is currently paused.
+    if (!indexManager_->isAnyIndexingPaused()) {
+        pauseResumeButton_->setText(tr("Пауза"));
+    }
     runSearch();
 }
 
@@ -325,4 +333,16 @@ void MainWindow::onExcludeMasksEdited() {
 
     QSettings settings;
     settings.setValue(kSettingsExcludeMasksKey, excludeMasksEdit_->text());
+}
+
+void MainWindow::onPauseResumeClicked() {
+    if (indexManager_->isAnyIndexingPaused()) {
+        indexManager_->resumeAllIndexing();
+        pauseResumeButton_->setText(tr("Пауза"));
+        statusLabel_->setText(tr("Индексация возобновлена"));
+    } else {
+        indexManager_->pauseAllIndexing();
+        pauseResumeButton_->setText(tr("Продолжить"));
+        statusLabel_->setText(tr("Индексация приостановлена"));
+    }
 }

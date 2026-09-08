@@ -37,6 +37,7 @@ private slots:
     void onResultDoubleClicked(const QModelIndex& index);
     void onWatcherActivity(const QString& rootLabel, const QString& description);
     void onSourceUnavailable(const QString& rootLabel);
+    void onPauseResumeClicked();
     void onExcludeMasksEdited();
 
 private:
@@ -59,5 +60,6 @@ private:
     QProgressBar* progressBar_ = nullptr;
     QLabel* statusLabel_ = nullptr;
     QPushButton* indexButton_ = nullptr;
+    QPushButton* pauseResumeButton_ = nullptr;
     QTimer searchDebounce_;
 };

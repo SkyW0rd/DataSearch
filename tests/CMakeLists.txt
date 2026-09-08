@@ -8,6 +8,8 @@ add_executable(datasearch_core_tests
   core/TestSourceRegistry.cpp
   core/TestIndexerReconcile.cpp
   core/TestSearchQueryParser.cpp
+  core/TestIndexerPauseResume.cpp
+  core/TestSearchPerformance.cpp
 )
 
 target_link_libraries(datasearch_core_tests PRIVATE datasearch_core)

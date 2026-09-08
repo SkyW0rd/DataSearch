@@ -65,6 +65,16 @@ public:
     // the user re-selects them from the volume list.
     std::vector<std::string> knownRoots() const;
 
+    // Pauses/resumes every currently active background scan or
+    // reconciliation (ТЗ п.12.3 UI: "поставить индексацию на паузу", e.g. so
+    // the user can reclaim CPU/disk for a game or render). Files already in
+    // flight finish normally; nothing already indexed is lost, and a paused
+    // scan resumes exactly where it left off. Newly started scans are not
+    // paused by this past state — it only affects what's running right now.
+    void pauseAllIndexing();
+    void resumeAllIndexing();
+    bool isAnyIndexingPaused() const;
+
 signals:
     void progress(quint64 filesIndexed, QString currentPath, QString rootLabel);
     void finished(QString rootLabel, bool cancelled);

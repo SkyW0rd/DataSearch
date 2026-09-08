@@ -13,6 +13,8 @@ void runContentExtractorTests();
 void runSourceRegistryTests();
 void runIndexerReconcileTests();
 void runIndexerUnavailableRootTests();
+void runIndexerPauseResumeTests();
+void runSearchPerformanceTests();
 void runSearchQueryParserTests();
 
 namespace {
@@ -36,6 +38,8 @@ int main() {
         {"SourceRegistry", runSourceRegistryTests},
         {"IndexerReconcile", runIndexerReconcileTests},
         {"IndexerUnavailableRoot", runIndexerUnavailableRootTests},
+        {"IndexerPauseResume", runIndexerPauseResumeTests},
+        {"SearchPerformance", runSearchPerformanceTests},
         {"SearchQueryParser", runSearchQueryParserTests},
     };
 
