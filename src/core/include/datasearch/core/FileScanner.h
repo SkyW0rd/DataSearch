@@ -5,6 +5,7 @@
 #include <atomic>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,14 @@ public:
                       const ScanOptions& options,
                       const FileVisitor& visitor,
                       const std::atomic<bool>* cancelled = nullptr);
+
+    // Metadata for exactly one file, without walking the rest of the tree —
+    // used to apply a single live filesystem-change event (ТЗ FR-6/п.13.2)
+    // cheaply, instead of re-scanning the whole source. Returns std::nullopt
+    // if `path` doesn't exist, isn't a regular file, or matches an exclude
+    // mask in `options` (by filename, same rule as scan()).
+    static std::optional<FileRecord> statFile(const std::filesystem::path& path,
+                                               const ScanOptions& options = {});
 };
 
 } // namespace datasearch::core

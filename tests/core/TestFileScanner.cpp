@@ -70,4 +70,14 @@ void runFileScannerTests() {
     std::size_t visitedAfterCancel = 0;
     FileScanner::scan(root, {}, [&](const FileRecord&) { ++visitedAfterCancel; }, &cancelled);
     DS_CHECK_EQ(visitedAfterCancel, std::size_t{0});
+
+    // statFile: single-file metadata, used to apply one live-watcher event
+    // without rescanning the whole tree (ТЗ FR-6/п.13.2).
+    auto stat = FileScanner::statFile(root / "alpha.txt", options);
+    DS_CHECK(stat.has_value());
+    DS_CHECK_EQ(stat->name, std::string("alpha.txt"));
+    DS_CHECK_EQ(stat->size, std::uint64_t{5});
+
+    DS_CHECK(!FileScanner::statFile(root / "does_not_exist.txt", options).has_value());
+    DS_CHECK(!FileScanner::statFile(root / "skip.tmp", options).has_value());  // excluded by mask
 }

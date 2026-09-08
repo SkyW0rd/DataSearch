@@ -130,4 +130,38 @@ void FileScanner::scan(const std::filesystem::path& root,
     }
 }
 
+std::optional<FileRecord> FileScanner::statFile(const std::filesystem::path& path,
+                                                 const ScanOptions& options) {
+    std::error_code ec;
+
+    const bool isRegular = std::filesystem::is_regular_file(path, ec);
+    if (ec || !isRegular) return std::nullopt;
+
+    const std::string name = pathToUtf8(path.filename());
+    if (matchesAnyMask(options.excludeMasks, name)) return std::nullopt;
+
+    FileRecord record;
+    record.path = pathToUtf8(path);
+    record.name = name;
+    record.extension = pathToUtf8(path.extension());
+
+    record.size = static_cast<std::uint64_t>(std::filesystem::file_size(path, ec));
+    if (ec) {
+        ec.clear();
+        record.size = 0;
+    }
+
+    const auto mtime = std::filesystem::last_write_time(path, ec);
+    if (!ec) {
+        record.modifiedTime = toEpochSeconds(mtime);
+    }
+    ec.clear();
+
+    if (options.creationTimeProvider) {
+        record.createdTime = options.creationTimeProvider(path);
+    }
+
+    return record;
+}
+
 } // namespace datasearch::core

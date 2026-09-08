@@ -6,6 +6,8 @@
 #include "datasearch/core/IndexStorage.h"
 #include "datasearch/core/Utf8.h"
 
+#include <set>
+
 #include <QAbstractItemView>
 #include <QAction>
 #include <QClipboard>
@@ -19,6 +21,7 @@
 #include <QMessageBox>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QSettings>
 #include <QSplitter>
 #include <QStatusBar>
 #include <QTableView>
@@ -26,6 +29,11 @@
 
 using datasearch::core::SearchQuery;
 using datasearch::platform::VolumeType;
+
+namespace {
+const char* kSettingsExcludeMasksKey = "excludeMasks";
+const char* kDefaultExcludeMasks = "*.tmp, node_modules, .git";
+} // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle(tr("DataSearch"));
@@ -51,6 +59,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     searchLayout->addWidget(searchEdit_, 1);
     searchLayout->addWidget(indexButton_);
     rootLayout->addLayout(searchLayout);
+
+    auto* settingsLayout = new QHBoxLayout();
+    auto* excludeMasksLabel = new QLabel(tr("Исключить (маски через запятую):"), central);
+    excludeMasksEdit_ = new QLineEdit(central);
+    excludeMasksEdit_->setPlaceholderText(kDefaultExcludeMasks);
+    settingsLayout->addWidget(excludeMasksLabel);
+    settingsLayout->addWidget(excludeMasksEdit_, 1);
+    rootLayout->addLayout(settingsLayout);
 
     auto* splitter = new QSplitter(Qt::Horizontal, central);
 
@@ -92,13 +108,30 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(resultsView_, &QTableView::customContextMenuRequested, this,
             &MainWindow::onResultsContextMenuRequested);
     connect(resultsView_, &QTableView::doubleClicked, this, &MainWindow::onResultDoubleClicked);
+    connect(indexManager_, &IndexManager::watcherActivity, this, &MainWindow::onWatcherActivity);
+    connect(excludeMasksEdit_, &QLineEdit::editingFinished, this, &MainWindow::onExcludeMasksEdited);
+
+    {
+        QSettings settings;
+        const QString saved = settings.value(kSettingsExcludeMasksKey, kDefaultExcludeMasks).toString();
+        excludeMasksEdit_->setText(saved);
+    }
+    onExcludeMasksEdited();
 
     populateVolumes();
+
+    // Reopen sources from a previous session instantly, then reconcile them
+    // in the background (ТЗ п.13.1/FR-23) — search works right away below.
+    indexManager_->loadKnownSources();
+    runSearch();
 }
 
 void MainWindow::populateVolumes() {
     volumeList_->clear();
     if (!platform_) return;
+
+    const auto knownRoots = indexManager_->knownRoots();
+    const std::set<std::string> knownRootsStd(knownRoots.begin(), knownRoots.end());
 
     std::vector<datasearch::platform::VolumeInfo> volumes;
     try {
@@ -132,7 +165,11 @@ void MainWindow::populateVolumes() {
 
         auto* item = new QListWidgetItem(text, volumeList_);
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-        item->setCheckState(Qt::Unchecked);
+        // Sources reopened from a previous session (ТЗ п.13.1) start checked,
+        // so their already-indexed results show up without the user having
+        // to re-select them.
+        const bool known = knownRootsStd.count(volume.rootPath) != 0;
+        item->setCheckState(known ? Qt::Checked : Qt::Unchecked);
         item->setData(Qt::UserRole, root);
     }
 }
@@ -256,4 +293,26 @@ void MainWindow::showRowInFolder(int row) {
 void MainWindow::copyRowPath(int row) {
     const auto& record = resultsModel_->recordAt(row);
     QGuiApplication::clipboard()->setText(QString::fromStdString(record.path));
+}
+
+void MainWindow::onWatcherActivity(const QString& rootLabel, const QString& description) {
+    statusLabel_->setText(QString("%1: %2").arg(rootLabel, description));
+}
+
+std::vector<std::string> MainWindow::parseExcludeMasks() const {
+    std::vector<std::string> masks;
+    const QStringList parts = excludeMasksEdit_->text().split(',', Qt::SkipEmptyParts);
+    for (const QString& part : parts) {
+        const QString trimmed = part.trimmed();
+        if (!trimmed.isEmpty()) masks.push_back(trimmed.toStdString());
+    }
+    return masks;
+}
+
+void MainWindow::onExcludeMasksEdited() {
+    const auto masks = parseExcludeMasks();
+    indexManager_->setExcludeMasks(masks);
+
+    QSettings settings;
+    settings.setValue(kSettingsExcludeMasksKey, excludeMasksEdit_->text());
 }

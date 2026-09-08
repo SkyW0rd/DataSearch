@@ -9,6 +9,8 @@ void runIndexStorageContentSearchTests();
 void runSearchEngineTests();
 void runRussianStemmerTests();
 void runContentExtractorTests();
+void runSourceRegistryTests();
+void runIndexerReconcileTests();
 
 namespace {
 
@@ -27,6 +29,8 @@ int main() {
         {"SearchEngine", runSearchEngineTests},
         {"RussianStemmer", runRussianStemmerTests},
         {"ContentExtractor", runContentExtractorTests},
+        {"SourceRegistry", runSourceRegistryTests},
+        {"IndexerReconcile", runIndexerReconcileTests},
     };
 
     int failures = 0;

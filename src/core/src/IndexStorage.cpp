@@ -147,18 +147,21 @@ IndexStorage::~IndexStorage() {
 }
 
 void IndexStorage::beginBatch() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (inBatch_) return;
     execOrThrow(db_, "BEGIN IMMEDIATE;");
     inBatch_ = true;
 }
 
 void IndexStorage::commitBatch() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!inBatch_) return;
     execOrThrow(db_, "COMMIT;");
     inBatch_ = false;
 }
 
 void IndexStorage::upsertFile(const FileRecord& record, const std::string& content) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     const bool ownTransaction = !inBatch_;
     if (ownTransaction) beginBatch();
 
@@ -207,6 +210,7 @@ void IndexStorage::upsertFile(const FileRecord& record, const std::string& conte
 }
 
 void IndexStorage::removeFile(const std::string& path) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     const bool ownTransaction = !inBatch_;
     if (ownTransaction) beginBatch();
 
@@ -233,6 +237,7 @@ void IndexStorage::removeFile(const std::string& path) {
 }
 
 std::vector<FileRecord> IndexStorage::allRecords() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<FileRecord> results;
     Statement stmt(db_, "SELECT path, name, ext, size, created_time, modified_time FROM files;");
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -242,6 +247,7 @@ std::vector<FileRecord> IndexStorage::allRecords() const {
 }
 
 std::vector<FileRecord> IndexStorage::search(const SearchQuery& query) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<FileRecord> results;
 
     if (query.namePattern.empty()) {
@@ -282,6 +288,7 @@ std::vector<FileRecord> IndexStorage::search(const SearchQuery& query) const {
 }
 
 std::uint64_t IndexStorage::fileCount() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     Statement stmt(db_, "SELECT COUNT(*) FROM files;");
     std::uint64_t count = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {

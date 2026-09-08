@@ -8,6 +8,8 @@
 #include <QTimer>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 class QLineEdit;
 class QListWidget;
@@ -33,6 +35,8 @@ private slots:
     void onIndexFinished(const QString& rootLabel, bool cancelled);
     void onResultsContextMenuRequested(const QPoint& pos);
     void onResultDoubleClicked(const QModelIndex& index);
+    void onWatcherActivity(const QString& rootLabel, const QString& description);
+    void onExcludeMasksEdited();
 
 private:
     void populateVolumes();
@@ -41,11 +45,14 @@ private:
     void showRowInFolder(int row);
     void copyRowPath(int row);
 
+    std::vector<std::string> parseExcludeMasks() const;
+
     std::unique_ptr<datasearch::platform::IPlatformService> platform_;
     IndexManager* indexManager_ = nullptr;
 
     QListWidget* volumeList_ = nullptr;
     QLineEdit* searchEdit_ = nullptr;
+    QLineEdit* excludeMasksEdit_ = nullptr;
     QTableView* resultsView_ = nullptr;
     ResultsTableModel* resultsModel_ = nullptr;
     QProgressBar* progressBar_ = nullptr;

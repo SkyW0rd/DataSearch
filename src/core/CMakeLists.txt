@@ -24,6 +24,7 @@ add_library(datasearch_core STATIC
   src/ContentExtractor.cpp
   src/RussianStemmer.cpp
   src/Fts5RussianTokenizer.cpp
+  src/SourceRegistry.cpp
 )
 
 target_include_directories(datasearch_core PUBLIC

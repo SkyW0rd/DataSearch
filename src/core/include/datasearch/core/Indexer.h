@@ -34,10 +34,10 @@ struct IndexerOptions {
     std::function<void()> onWorkerThreadStart;
 };
 
-// Runs a full scan of one or more roots on a background thread pool and
-// writes the results (metadata + extracted content, ТЗ FR-3) into `storage`,
-// batching writes into transactions for throughput (ТЗ FR-4: индексация не
-// блокирует UI). Several roots are scanned in parallel across up to
+// Runs scans of one or more roots on a background thread pool and writes the
+// results (metadata + extracted content, ТЗ FR-3) into `storage`, batching
+// writes into transactions for throughput (ТЗ FR-4: индексация не блокирует
+// UI). Several roots are scanned in parallel across up to
 // IndexerOptions::threadCount worker threads (ТЗ п.11.4: несколько дисков
 // одновременно); storage writes are serialized internally regardless.
 // One Indexer runs one scan at a time; call join() (or destroy the Indexer)
@@ -51,9 +51,22 @@ public:
     Indexer(const Indexer&) = delete;
     Indexer& operator=(const Indexer&) = delete;
 
+    // Full (re)index: every visited file is (re-)extracted and written,
+    // regardless of what's already in `storage`.
     void start(std::vector<std::filesystem::path> roots,
                ProgressCallback onProgress = nullptr,
                CompletionCallback onComplete = nullptr);
+
+    // Metadata-only reconciliation pass (ТЗ п.13.2 — "сверка по возвращении"):
+    // walks `roots` comparing each file's size/modified-time against what's
+    // already in `storage`, WITHOUT re-reading unchanged files. A file is
+    // (re-)extracted only if it's new or its size/mtime differ from the
+    // stored record; a stored path no longer present on disk is removed.
+    // Much cheaper than start() for the common case where little changed
+    // while the source wasn't being watched.
+    void startReconcile(std::vector<std::filesystem::path> roots,
+                         ProgressCallback onProgress = nullptr,
+                         CompletionCallback onComplete = nullptr);
 
     // Requests the running scan to stop at the next visited entry. Does not block.
     void cancel();
@@ -74,9 +87,10 @@ private:
     std::atomic<bool> running_{false};
     std::thread worker_;
 
-    void run(std::vector<std::filesystem::path> roots,
-             ProgressCallback onProgress,
-             CompletionCallback onComplete);
+    void runInternal(std::vector<std::filesystem::path> roots,
+                      ProgressCallback onProgress,
+                      CompletionCallback onComplete,
+                      bool reconcileMode);
 };
 
 } // namespace datasearch::core
