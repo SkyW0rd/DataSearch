@@ -206,6 +206,10 @@ public:
                                                       FileSystemChangeCallback onChange) override {
         return std::make_unique<DirectoryWatchWin32>(root, std::move(onChange));
     }
+
+    void lowerCurrentThreadPriority() override {
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
 };
 
 } // namespace

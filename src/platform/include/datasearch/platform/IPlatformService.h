@@ -55,6 +55,12 @@ public:
     // handle must outlive the desired watch duration.
     virtual std::unique_ptr<IDirectoryWatch> watchDirectory(const std::filesystem::path& root,
                                                               FileSystemChangeCallback onChange) = 0;
+
+    // Lowers the *calling* thread's OS scheduling priority (Windows:
+    // THREAD_PRIORITY_BELOW_NORMAL) so background indexing (ТЗ п.12.3)
+    // doesn't compete with the user's foreground work for CPU time. Meant to
+    // be called once, from inside each indexing worker thread.
+    virtual void lowerCurrentThreadPriority() = 0;
 };
 
 // Constructs the platform implementation for the OS this binary was built for.

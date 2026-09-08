@@ -6,11 +6,12 @@
 
 #include <vector>
 
-// Backs the results QTableView: Имя | Путь | Размер | Дата изменения (ТЗ FR-15).
+// Backs the results QTableView: Имя | Путь | Размер | Дата изменения | Фрагмент
+// с подсветкой найденного (ТЗ FR-15).
 class ResultsTableModel : public QAbstractTableModel {
     Q_OBJECT
 public:
-    enum Column { ColumnName = 0, ColumnPath, ColumnSize, ColumnModified, ColumnCount };
+    enum Column { ColumnName = 0, ColumnPath, ColumnSize, ColumnModified, ColumnSnippet, ColumnCount };
 
     explicit ResultsTableModel(QObject* parent = nullptr);
 

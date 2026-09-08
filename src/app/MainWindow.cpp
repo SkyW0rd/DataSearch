@@ -25,8 +25,6 @@
 #include <QVBoxLayout>
 
 using datasearch::core::SearchQuery;
-using datasearch::core::SortField;
-using datasearch::core::SortOrder;
 using datasearch::platform::VolumeType;
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
@@ -40,7 +38,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             tr("Не удалось инициализировать платформенный слой: %1").arg(e.what()));
     }
 
-    indexManager_ = new IndexManager(this);
+    indexManager_ = new IndexManager(platform_.get(), this);
     resultsModel_ = new ResultsTableModel(this);
 
     auto* central = new QWidget(this);
@@ -48,7 +46,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     auto* searchLayout = new QHBoxLayout();
     searchEdit_ = new QLineEdit(central);
-    searchEdit_->setPlaceholderText(tr("Поиск по имени файла..."));
+    searchEdit_->setPlaceholderText(tr("Поиск по имени и содержимому файлов..."));
     indexButton_ = new QPushButton(tr("Индексировать выбранные"), central);
     searchLayout->addWidget(searchEdit_, 1);
     searchLayout->addWidget(indexButton_);
@@ -168,8 +166,10 @@ void MainWindow::runSearch() {
 
     SearchQuery query;
     query.namePattern = searchEdit_->text().toStdString();
-    query.sortField = SortField::Name;
-    query.sortOrder = SortOrder::Ascending;
+    // Relevance (BM25, name weighted above content, ТЗ п.8) is SearchQuery's
+    // default sort — matches Elasticsearch-style ranked results; browsing
+    // with an empty query naturally falls back to a plain name-sorted list
+    // (see IndexStorage::search).
     query.limit = 500;
     query.offset = 0;
 

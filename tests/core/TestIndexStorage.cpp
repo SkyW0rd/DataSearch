@@ -80,3 +80,50 @@ void runIndexStorageTests() {
     auto paged = storage.search(page);
     DS_CHECK_EQ(paged.size(), std::size_t{1});
 }
+
+void runIndexStorageContentSearchTests() {
+    IndexStorage storage(":memory:");
+
+    FileRecord doc;
+    doc.path = "/d/instructions.txt";
+    doc.name = "instructions.txt";
+    doc.extension = ".txt";
+    doc.size = 42;
+    doc.modifiedTime = 111;
+
+    // Content: "Инструкция к практикуму номер один" — a content-only match,
+    // using a different inflected form of "практикум" ("практикуму", dative)
+    // than the one searched for below ("практикума", genitive), to prove the
+    // Russian stemmer is actually wired into the FTS5 tokenizer end-to-end,
+    // not just unit-tested in isolation. Written as raw UTF-8 byte escapes
+    // (rather than literal Cyrillic source characters) so this file's bytes
+    // are plain ASCII regardless of the compiler's assumed source encoding.
+    const std::string content =
+        "\xd0\x98\xd0\xbd\xd1\x81\xd1\x82\xd1\x80\xd1\x83\xd0\xba\xd1\x86\xd0\xb8\xd1\x8f "
+        "\xd0\xba \xd0\xbf\xd1\x80\xd0\xb0\xd0\xba\xd1\x82\xd0\xb8\xd0\xba\xd1\x83\xd0\xbc\xd1\x83 "
+        "\xd0\xbd\xd0\xbe\xd0\xbc\xd0\xb5\xd1\x80 \xd0\xbe\xd0\xb4\xd0\xb8\xd0\xbd";
+    storage.upsertFile(doc, content);
+
+    FileRecord other;
+    other.path = "/d/unrelated.txt";
+    other.name = "unrelated.txt";
+    other.extension = ".txt";
+    other.size = 5;
+    other.modifiedTime = 222;
+    storage.upsertFile(other, "just some unrelated english text");
+
+    // "практикума" (genitive) — must still match "практикуму" (dative) above.
+    SearchQuery q;
+    q.namePattern = "\xd0\xbf\xd1\x80\xd0\xb0\xd0\xba\xd1\x82\xd0\xb8\xd0\xba\xd1\x83\xd0\xbc\xd0\xb0";
+    auto results = storage.search(q);
+    DS_CHECK_EQ(results.size(), std::size_t{1});
+    DS_CHECK_EQ(results[0].path, doc.path);
+    DS_CHECK(!results[0].snippet.empty());
+
+    // A plain English word search should not accidentally match the Russian doc.
+    SearchQuery qEnglish;
+    qEnglish.namePattern = "unrelated";
+    auto englishResults = storage.search(qEnglish);
+    DS_CHECK_EQ(englishResults.size(), std::size_t{1});
+    DS_CHECK_EQ(englishResults[0].path, other.path);
+}

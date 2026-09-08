@@ -1,31 +1,14 @@
 #include "datasearch/core/IndexStorage.h"
 
+#include "datasearch/core/Fts5RussianTokenizer.h"
+
 #include <sqlite3.h>
 
-#include <algorithm>
-#include <cctype>
 #include <stdexcept>
 
 namespace datasearch::core {
 
 namespace {
-
-std::string toLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return s;
-}
-
-// Escapes '%', '_' and the escape character itself for a SQL LIKE '...' ESCAPE '\' clause.
-std::string escapeLikePattern(const std::string& raw) {
-    std::string out;
-    out.reserve(raw.size());
-    for (char c : raw) {
-        if (c == '%' || c == '_' || c == '\\') out.push_back('\\');
-        out.push_back(c);
-    }
-    return out;
-}
 
 class Statement {
 public:
@@ -54,25 +37,78 @@ void execOrThrow(sqlite3* db, const char* sql) {
     }
 }
 
+// files_fts is a self-contained FTS5 table (not content='files'): an earlier
+// external-content design hit a reproducible "database disk image is
+// malformed" error from bm25() specifically on external-content tables with
+// this SQLite build (confirmed in isolation, unrelated to the custom
+// tokenizer or to this project's own code) — self-contained duplicates
+// name/content bytes into the FTS5 shadow storage but is the well-supported,
+// documented configuration, and NFR-4's index-size budget already expects
+// some FTS overhead.
 const char* kSchemaSql = R"SQL(
 CREATE TABLE IF NOT EXISTS files (
-    path TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
+    path TEXT UNIQUE NOT NULL,
     name TEXT NOT NULL,
-    name_lower TEXT NOT NULL,
     ext TEXT NOT NULL,
     size INTEGER NOT NULL,
     created_time INTEGER NOT NULL,
     modified_time INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_files_name_lower ON files(name_lower);
+CREATE INDEX IF NOT EXISTS idx_files_name ON files(name COLLATE NOCASE);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+    name, content,
+    tokenize='ru_snowball'
+);
 )SQL";
 
-const char* sortColumn(SortField field) {
+const char* sortColumnPlain(SortField field) {
     switch (field) {
         case SortField::ModifiedTime: return "modified_time";
         case SortField::Size: return "size";
-        case SortField::Name: default: return "name_lower";
+        default: return "name COLLATE NOCASE";
     }
+}
+
+const char* sortColumnFts(SortField field) {
+    switch (field) {
+        case SortField::ModifiedTime: return "f.modified_time";
+        case SortField::Size: return "f.size";
+        case SortField::Name: return "f.name COLLATE NOCASE";
+        default: return "bm25(files_fts, 10.0, 1.0)";
+    }
+}
+
+// Wraps `pattern` as a single quoted FTS5 phrase with a trailing prefix
+// wildcard (e.g. практик -> "практик"*), so arbitrary user text (spaces,
+// punctuation) is always a well-formed MATCH expression, while still
+// supporting partial/prefix matches (ТЗ FR-10). Operators like ext:/path:/
+// quoted phrases/minus-words (ТЗ FR-13) are a later stage, not this one.
+std::string buildMatchExpression(const std::string& pattern) {
+    std::string escaped;
+    escaped.reserve(pattern.size() + 2);
+    for (char c : pattern) {
+        if (c == '"') escaped += "\"\"";
+        else escaped += c;
+    }
+    return "\"" + escaped + "\"*";
+}
+
+FileRecord readRow(sqlite3_stmt* stmt, bool hasSnippet) {
+    FileRecord record;
+    record.path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+    record.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    record.extension = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+    record.size = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
+    record.createdTime = sqlite3_column_int64(stmt, 4);
+    record.modifiedTime = sqlite3_column_int64(stmt, 5);
+    if (hasSnippet) {
+        const unsigned char* snip = sqlite3_column_text(stmt, 6);
+        record.snippet = snip != nullptr ? reinterpret_cast<const char*>(snip) : "";
+        record.relevanceScore = sqlite3_column_double(stmt, 7);
+    }
+    return record;
 }
 
 } // namespace
@@ -90,6 +126,14 @@ IndexStorage::IndexStorage(const std::filesystem::path& dbPath) {
     execOrThrow(db_, "PRAGMA journal_mode=WAL;");
     execOrThrow(db_, "PRAGMA synchronous=NORMAL;");
     execOrThrow(db_, "PRAGMA foreign_keys=ON;");
+
+    if (!registerRussianFts5Tokenizer(db_)) {
+        sqlite3_close(db_);
+        db_ = nullptr;
+        throw std::runtime_error("Failed to register the 'ru_snowball' FTS5 tokenizer "
+                                  "(this SQLite build may lack FTS5)");
+    }
+
     execOrThrow(db_, kSchemaSql);
 }
 
@@ -114,29 +158,49 @@ void IndexStorage::commitBatch() {
     inBatch_ = false;
 }
 
-void IndexStorage::upsertFile(const FileRecord& record) {
+void IndexStorage::upsertFile(const FileRecord& record, const std::string& content) {
     const bool ownTransaction = !inBatch_;
     if (ownTransaction) beginBatch();
 
-    static const char* kSql =
-        "INSERT INTO files(path, name, name_lower, ext, size, created_time, modified_time) "
-        "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) "
+    static const char* kUpsertSql =
+        "INSERT INTO files(path, name, ext, size, created_time, modified_time) "
+        "VALUES(?1, ?2, ?3, ?4, ?5, ?6) "
         "ON CONFLICT(path) DO UPDATE SET "
-        "  name=excluded.name, name_lower=excluded.name_lower, ext=excluded.ext, "
-        "  size=excluded.size, created_time=excluded.created_time, modified_time=excluded.modified_time;";
+        "  name=excluded.name, ext=excluded.ext, size=excluded.size, "
+        "  created_time=excluded.created_time, modified_time=excluded.modified_time "
+        "RETURNING id;";
 
-    Statement stmt(db_, kSql);
-    const std::string nameLower = toLower(record.name);
-    sqlite3_bind_text(stmt, 1, record.path.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, record.name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, nameLower.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, record.extension.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 5, static_cast<sqlite3_int64>(record.size));
-    sqlite3_bind_int64(stmt, 6, static_cast<sqlite3_int64>(record.createdTime));
-    sqlite3_bind_int64(stmt, 7, static_cast<sqlite3_int64>(record.modifiedTime));
+    sqlite3_int64 rowId = 0;
+    {
+        Statement stmt(db_, kUpsertSql);
+        sqlite3_bind_text(stmt, 1, record.path.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, record.name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, record.extension.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(record.size));
+        sqlite3_bind_int64(stmt, 5, static_cast<sqlite3_int64>(record.createdTime));
+        sqlite3_bind_int64(stmt, 6, static_cast<sqlite3_int64>(record.modifiedTime));
 
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        throw std::runtime_error(std::string("Failed to upsert file: ") + sqlite3_errmsg(db_));
+        if (sqlite3_step(stmt) != SQLITE_ROW) {
+            throw std::runtime_error(std::string("Failed to upsert file: ") + sqlite3_errmsg(db_));
+        }
+        rowId = sqlite3_column_int64(stmt, 0);
+    }
+
+    {
+        // Self-contained FTS5 table, kept in sync manually: drop any previous
+        // row for this id, then re-insert with the current name/content.
+        Statement del(db_, "DELETE FROM files_fts WHERE rowid = ?1;");
+        sqlite3_bind_int64(del, 1, rowId);
+        sqlite3_step(del);
+    }
+    {
+        Statement ins(db_, "INSERT INTO files_fts(rowid, name, content) VALUES (?1, ?2, ?3);");
+        sqlite3_bind_int64(ins, 1, rowId);
+        sqlite3_bind_text(ins, 2, record.name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins, 3, content.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(ins) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("Failed to update FTS index: ") + sqlite3_errmsg(db_));
+        }
     }
 
     if (ownTransaction) commitBatch();
@@ -146,10 +210,23 @@ void IndexStorage::removeFile(const std::string& path) {
     const bool ownTransaction = !inBatch_;
     if (ownTransaction) beginBatch();
 
-    Statement stmt(db_, "DELETE FROM files WHERE path = ?1;");
-    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        throw std::runtime_error(std::string("Failed to remove file: ") + sqlite3_errmsg(db_));
+    sqlite3_int64 rowId = -1;
+    {
+        Statement sel(db_, "SELECT id FROM files WHERE path = ?1;");
+        sqlite3_bind_text(sel, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel) == SQLITE_ROW) rowId = sqlite3_column_int64(sel, 0);
+    }
+    if (rowId >= 0) {
+        Statement delFts(db_, "DELETE FROM files_fts WHERE rowid = ?1;");
+        sqlite3_bind_int64(delFts, 1, rowId);
+        sqlite3_step(delFts);
+    }
+    {
+        Statement del(db_, "DELETE FROM files WHERE path = ?1;");
+        sqlite3_bind_text(del, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(del) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("Failed to remove file: ") + sqlite3_errmsg(db_));
+        }
     }
 
     if (ownTransaction) commitBatch();
@@ -159,43 +236,47 @@ std::vector<FileRecord> IndexStorage::allRecords() const {
     std::vector<FileRecord> results;
     Statement stmt(db_, "SELECT path, name, ext, size, created_time, modified_time FROM files;");
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        FileRecord record;
-        record.path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        record.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        record.extension = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        record.size = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
-        record.createdTime = sqlite3_column_int64(stmt, 4);
-        record.modifiedTime = sqlite3_column_int64(stmt, 5);
-        results.push_back(std::move(record));
+        results.push_back(readRow(stmt, /*hasSnippet=*/false));
     }
     return results;
 }
 
 std::vector<FileRecord> IndexStorage::search(const SearchQuery& query) const {
+    std::vector<FileRecord> results;
+
+    if (query.namePattern.empty()) {
+        std::string sql = "SELECT path, name, ext, size, created_time, modified_time FROM files ORDER BY ";
+        sql += sortColumnPlain(query.sortField);
+        sql += query.sortOrder == SortOrder::Descending ? " DESC" : " ASC";
+        sql += " LIMIT ?1 OFFSET ?2;";
+
+        Statement stmt(db_, sql.c_str());
+        sqlite3_bind_int(stmt, 1, query.limit);
+        sqlite3_bind_int(stmt, 2, query.offset);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            results.push_back(readRow(stmt, /*hasSnippet=*/false));
+        }
+        return results;
+    }
+
     std::string sql =
-        "SELECT path, name, ext, size, created_time, modified_time FROM files "
-        "WHERE name_lower LIKE ?1 ESCAPE '\\' "
-        "ORDER BY ";
-    sql += sortColumn(query.sortField);
+        "SELECT f.path, f.name, f.ext, f.size, f.created_time, f.modified_time, "
+        "       snippet(files_fts, 1, '[', ']', '...', 12), "
+        "       bm25(files_fts, 10.0, 1.0) "
+        "FROM files_fts JOIN files f ON f.id = files_fts.rowid "
+        "WHERE files_fts MATCH ?1 ORDER BY ";
+    sql += sortColumnFts(query.sortField);
     sql += query.sortOrder == SortOrder::Descending ? " DESC" : " ASC";
     sql += " LIMIT ?2 OFFSET ?3;";
 
     Statement stmt(db_, sql.c_str());
-    const std::string pattern = "%" + escapeLikePattern(toLower(query.namePattern)) + "%";
-    sqlite3_bind_text(stmt, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
+    const std::string matchExpr = buildMatchExpression(query.namePattern);
+    sqlite3_bind_text(stmt, 1, matchExpr.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, query.limit);
     sqlite3_bind_int(stmt, 3, query.offset);
 
-    std::vector<FileRecord> results;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        FileRecord record;
-        record.path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        record.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        record.extension = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        record.size = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
-        record.createdTime = sqlite3_column_int64(stmt, 4);
-        record.modifiedTime = sqlite3_column_int64(stmt, 5);
-        results.push_back(std::move(record));
+        results.push_back(readRow(stmt, /*hasSnippet=*/true));
     }
     return results;
 }

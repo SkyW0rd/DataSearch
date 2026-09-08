@@ -3,6 +3,8 @@ add_executable(datasearch_core_tests
   core/TestFileScanner.cpp
   core/TestIndexStorage.cpp
   core/TestSearchEngine.cpp
+  core/TestRussianStemmer.cpp
+  core/TestContentExtractor.cpp
 )
 
 target_link_libraries(datasearch_core_tests PRIVATE datasearch_core)

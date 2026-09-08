@@ -5,6 +5,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Source files contain literal Cyrillic text (UI strings, the Russian Snowball
+# stemmer's suffix tables). Without this, MSVC assumes the system ANSI codepage
+# for both reading the source and encoding narrow string-literal bytes, which
+# silently corrupts that text; /utf-8 makes MSVC treat both source and
+# execution charset as UTF-8, matching Clang/GCC's default behaviour.
+if(MSVC)
+  add_compile_options(/utf-8)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()

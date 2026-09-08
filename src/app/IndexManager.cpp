@@ -6,13 +6,16 @@
 #include <QDir>
 #include <QStandardPaths>
 
+using datasearch::core::ExtractionOptions;
 using datasearch::core::FileRecord;
 using datasearch::core::IndexProgress;
 using datasearch::core::Indexer;
+using datasearch::core::IndexerOptions;
 using datasearch::core::IndexStorage;
 using datasearch::core::ScanOptions;
 using datasearch::core::SearchEngine;
 using datasearch::core::SearchQuery;
+using datasearch::platform::IPlatformService;
 
 namespace {
 
@@ -26,7 +29,8 @@ std::string sanitizeForFilename(const std::string& root) {
 
 } // namespace
 
-IndexManager::IndexManager(QObject* parent) : QObject(parent) {}
+IndexManager::IndexManager(IPlatformService* platform, QObject* parent)
+    : QObject(parent), platform_(platform) {}
 
 std::filesystem::path IndexManager::dbPathFor(const std::string& root) {
     const QString baseDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
@@ -44,7 +48,18 @@ void IndexManager::indexRoots(const std::vector<std::string>& roots) {
         }
         IndexStorage& storage = *storageIt->second;
 
-        auto indexer = std::make_unique<Indexer>(storage, ScanOptions{});
+        IndexerOptions indexerOptions;
+        IPlatformService* platform = platform_;
+        indexerOptions.onWorkerThreadStart = [platform]() {
+            if (platform == nullptr) return;
+            try {
+                platform->lowerCurrentThreadPriority();
+            } catch (...) {
+                // Best-effort (ТЗ п.12.3): indexing still works at normal priority.
+            }
+        };
+
+        auto indexer = std::make_unique<Indexer>(storage, ScanOptions{}, ExtractionOptions{}, indexerOptions);
         Indexer* indexerPtr = indexer.get();
         indexers_[root] = std::move(indexer);
 

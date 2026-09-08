@@ -2,6 +2,7 @@
 
 #include "datasearch/core/IndexStorage.h"
 #include "datasearch/core/Indexer.h"
+#include "datasearch/platform/IPlatformService.h"
 
 #include <QObject>
 #include <QString>
@@ -18,7 +19,9 @@
 class IndexManager : public QObject {
     Q_OBJECT
 public:
-    explicit IndexManager(QObject* parent = nullptr);
+    // `platform` is non-owning and may be null (e.g. if platform-service init
+    // failed) — thread-priority lowering is then simply skipped.
+    explicit IndexManager(datasearch::platform::IPlatformService* platform, QObject* parent = nullptr);
 
     // Opens (or creates) the index for each root not already indexed and starts
     // a background scan for it.
@@ -36,6 +39,7 @@ signals:
 private:
     static std::filesystem::path dbPathFor(const std::string& root);
 
+    datasearch::platform::IPlatformService* platform_ = nullptr;
     std::map<std::string, std::unique_ptr<datasearch::core::IndexStorage>> storages_;
     std::map<std::string, std::unique_ptr<datasearch::core::Indexer>> indexers_;
 };

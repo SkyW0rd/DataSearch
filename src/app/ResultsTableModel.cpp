@@ -63,6 +63,7 @@ QVariant ResultsTableModel::data(const QModelIndex& index, int role) const {
         case ColumnPath: return QString::fromStdString(record.path);
         case ColumnSize: return formatSize(record.size);
         case ColumnModified: return formatTime(record.modifiedTime);
+        case ColumnSnippet: return QString::fromStdString(record.snippet);
         default: return {};
     }
 }
@@ -76,6 +77,7 @@ QVariant ResultsTableModel::headerData(int section, Qt::Orientation orientation,
         case ColumnPath: return QObject::tr("Путь");
         case ColumnSize: return QObject::tr("Размер");
         case ColumnModified: return QObject::tr("Дата изменения");
+        case ColumnSnippet: return QObject::tr("Фрагмент");
         default: return {};
     }
 }

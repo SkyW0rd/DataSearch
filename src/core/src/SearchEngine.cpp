@@ -18,7 +18,13 @@ bool less(const FileRecord& a, const FileRecord& b, SortField field) {
     switch (field) {
         case SortField::ModifiedTime: return a.modifiedTime < b.modifiedTime;
         case SortField::Size: return a.size < b.size;
-        case SortField::Name: default: return toLowerCopy(a.name) < toLowerCopy(b.name);
+        case SortField::Name: return toLowerCopy(a.name) < toLowerCopy(b.name);
+        // bm25() is "smaller is more relevant" by FTS5 convention; comparing
+        // raw scores across independently-ranked per-disk indexes is an
+        // approximation (each index's term/document statistics differ), the
+        // same simplification real distributed search engines make when
+        // merging per-shard relevance scores.
+        case SortField::Relevance: default: return a.relevanceScore < b.relevanceScore;
     }
 }
 

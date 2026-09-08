@@ -13,6 +13,7 @@ if(APPLE)
 endif()
 
 find_package(SQLite3 REQUIRED)
+find_package(ZLIB REQUIRED)
 
 add_library(datasearch_core STATIC
   src/FileScanner.cpp
@@ -20,13 +21,16 @@ add_library(datasearch_core STATIC
   src/Indexer.cpp
   src/SearchEngine.cpp
   src/Utf8.cpp
+  src/ContentExtractor.cpp
+  src/RussianStemmer.cpp
+  src/Fts5RussianTokenizer.cpp
 )
 
 target_include_directories(datasearch_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-target_link_libraries(datasearch_core PUBLIC SQLite3::SQLite3)
+target_link_libraries(datasearch_core PUBLIC SQLite3::SQLite3 ZLIB::ZLIB)
 
 find_package(Threads REQUIRED)
 target_link_libraries(datasearch_core PUBLIC Threads::Threads)

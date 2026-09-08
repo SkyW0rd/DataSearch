@@ -5,7 +5,10 @@
 
 void runFileScannerTests();
 void runIndexStorageTests();
+void runIndexStorageContentSearchTests();
 void runSearchEngineTests();
+void runRussianStemmerTests();
+void runContentExtractorTests();
 
 namespace {
 
@@ -20,7 +23,10 @@ int main() {
     const std::vector<TestCase> tests = {
         {"FileScanner", runFileScannerTests},
         {"IndexStorage", runIndexStorageTests},
+        {"IndexStorageContentSearch", runIndexStorageContentSearchTests},
         {"SearchEngine", runSearchEngineTests},
+        {"RussianStemmer", runRussianStemmerTests},
+        {"ContentExtractor", runContentExtractorTests},
     };
 
     int failures = 0;
