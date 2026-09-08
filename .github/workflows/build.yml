@@ -5,6 +5,14 @@ name: Build
 # docs/TZ_DataSearch.md п.14 for which platforms are actually verified).
 # Pushing a tag like "v0.1.0" additionally publishes the packaged binaries as
 # a GitHub Release.
+#
+# Qt is installed via each platform's own package manager (Homebrew/apt)
+# rather than a third-party installer action: the installer-provided Qt
+# build pulled in a dependency on the AGL framework, which newer Xcode SDKs
+# no longer ship, breaking the macOS link step. Homebrew's qtbase (verified
+# locally — see README) doesn't have that problem. Windows has no equivalent
+# system package manager for Qt, so it's the one platform still using an
+# installer action.
 on:
   push:
     branches: [main]
@@ -28,18 +36,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Qt
+      - name: Install Qt (Windows)
+        if: runner.os == 'Windows'
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.7.*'
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install sqlite3
+        run: brew install qtbase sqlite3
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev zlib1g-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev libsqlite3-dev zlib1g-dev
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
