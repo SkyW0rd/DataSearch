@@ -60,7 +60,8 @@ CREATE INDEX IF NOT EXISTS idx_files_name ON files(name COLLATE NOCASE);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
     name, content,
-    tokenize='ru_snowball'
+    tokenize='ru_snowball',
+    prefix='2 3 4'
 );
 )SQL";
 

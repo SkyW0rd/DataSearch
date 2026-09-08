@@ -80,6 +80,7 @@ IndexManager::IndexManager(IPlatformService* platform, QObject* parent)
     });
 
     watcherThread_ = std::thread(&IndexManager::watcherThreadMain, this);
+    searchThread_ = std::thread(&IndexManager::searchThreadMain, this);
 }
 
 IndexManager::~IndexManager() {
@@ -89,6 +90,43 @@ IndexManager::~IndexManager() {
     }
     pendingCv_.notify_all();
     if (watcherThread_.joinable()) watcherThread_.join();
+
+    {
+        std::lock_guard<std::mutex> lock(searchMutex_);
+        searchStopping_ = true;
+    }
+    searchCv_.notify_all();
+    if (searchThread_.joinable()) searchThread_.join();
+}
+
+void IndexManager::searchAsync(SearchQuery query, std::vector<std::string> roots, QObject* context,
+                                std::function<void(std::vector<FileRecord>)> onDone) {
+    std::lock_guard<std::mutex> lock(searchMutex_);
+    pendingSearch_ = PendingSearch{std::move(query), std::move(roots), context, std::move(onDone)};
+    searchCv_.notify_one();
+}
+
+void IndexManager::searchThreadMain() {
+    while (true) {
+        PendingSearch job;
+        {
+            std::unique_lock<std::mutex> lock(searchMutex_);
+            searchCv_.wait(lock, [this] { return searchStopping_ || pendingSearch_.has_value(); });
+            if (searchStopping_ && !pendingSearch_.has_value()) return;
+            job = std::move(*pendingSearch_);
+            pendingSearch_.reset();
+        }
+
+        auto results = search(job.query, job.roots);
+
+        QObject* context = job.context;
+        auto onDone = std::move(job.onDone);
+        QMetaObject::invokeMethod(
+            context, [onDone = std::move(onDone), results = std::move(results)]() mutable {
+                onDone(std::move(results));
+            },
+            Qt::QueuedConnection);
+    }
 }
 
 std::filesystem::path IndexManager::dbPathFor(const std::string& root) {

@@ -1,0 +1,103 @@
+name: Build
+
+# Builds all three platforms on every push/PR (core tests always run; the app
+# only builds where IPlatformService has an implementation — see
+# docs/TZ_DataSearch.md п.14 for which platforms are actually verified).
+# Pushing a tag like "v0.1.0" additionally publishes the packaged binaries as
+# a GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: DataSearch-windows-x64
+          - os: macos-latest
+            artifact: DataSearch-macos
+          - os: ubuntu-latest
+            artifact: DataSearch-linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.*'
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sqlite3
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev zlib1g-dev
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: vcpkg install sqlite3[fts5]:x64-windows zlib:x64-windows
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Configure (macOS/Linux)
+        if: runner.os != 'Windows'
+        run: cmake -S . -B build
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Run core tests
+        run: ctest --test-dir build --output-on-failure --build-config Release
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          macdeployqt build/src/app/datasearch_app.app
+          mkdir dist
+          ditto -c -k --sequesterRsrc --keepParent build/src/app/datasearch_app.app "dist/${{ matrix.artifact }}.zip"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist_payload
+          Copy-Item build/src/app/Release/datasearch_app.exe dist_payload/
+          & "$env:QT_ROOT_DIR/bin/windeployqt.exe" dist_payload/datasearch_app.exe
+          New-Item -ItemType Directory -Path dist
+          Compress-Archive -Path dist_payload/* -DestinationPath "dist/${{ matrix.artifact }}.zip"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist_payload dist
+          cp build/src/app/datasearch_app dist_payload/
+          tar czf "dist/${{ matrix.artifact }}.tar.gz" -C dist_payload .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*

@@ -202,4 +202,29 @@ void runContentExtractorTests() {
         DS_CHECK(contains(*extracted, "\xd0\x90\xd0\x91"));
         DS_CHECK(!contains(*extracted, "AB"));
     }
+
+    // --- PDF: 2-byte (Identity-H/CID) codes via /ToUnicode ------------------
+    {
+        // A hex string of two 2-byte codes (0x0001, 0x0002) shown via Tj —
+        // how Type0/CID fonts represent text, the common way modern tools
+        // embed Cyrillic in a PDF. Neither code is printable ASCII on its
+        // own, so single-byte decoding would drop them entirely; the 2-byte
+        // heuristic must recognize this and use the CMap instead.
+        const std::string pdf =
+            "%PDF-1.4\n"
+            "1 0 obj\n<< /Type /Page >>\nstream\n"
+            "BT /F1 12 Tf 72 700 Td <00010002> Tj ET\n"
+            "endstream\nendobj\n"
+            "2 0 obj\n<< /Type /Font >>\nstream\n"
+            "beginbfchar\n<0001> <0412>\n<0002> <0413>\nendbfchar\n"
+            "endstream\nendobj\n"
+            "trailer\n<< /Root 1 0 R >>\n%%EOF\n";
+        const auto path = root / "cmap_cid.pdf";
+        writeFile(path, pdf);
+
+        auto extracted = ContentExtractor::extract(path, ".pdf");
+        DS_CHECK(extracted.has_value());
+        // "ВГ" (Cyrillic В, Г) via the 2-byte CMap lookup.
+        DS_CHECK(contains(*extracted, "\xd0\x92\xd0\x93"));
+    }
 }

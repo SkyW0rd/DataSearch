@@ -11,6 +11,8 @@
 #include <QAbstractItemView>
 #include <QAction>
 #include <QClipboard>
+#include <QDir>
+#include <QFileDialog>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -19,6 +21,7 @@
 #include <QListWidget>
 #include <QMenu>
 #include <QMessageBox>
+#include <QSet>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSettings>
@@ -73,8 +76,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     auto* splitter = new QSplitter(Qt::Horizontal, central);
 
-    volumeList_ = new QListWidget(splitter);
-    splitter->addWidget(volumeList_);
+    auto* sourcesPanel = new QWidget(splitter);
+    auto* sourcesLayout = new QVBoxLayout(sourcesPanel);
+    sourcesLayout->setContentsMargins(0, 0, 0, 0);
+    addFolderButton_ = new QPushButton(tr("Добавить папку..."), sourcesPanel);
+    sourcesLayout->addWidget(addFolderButton_);
+    volumeList_ = new QListWidget(sourcesPanel);
+    sourcesLayout->addWidget(volumeList_, 1);
+    splitter->addWidget(sourcesPanel);
 
     resultsView_ = new QTableView(splitter);
     resultsView_->setModel(resultsModel_);
@@ -114,6 +123,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(indexManager_, &IndexManager::watcherActivity, this, &MainWindow::onWatcherActivity);
     connect(indexManager_, &IndexManager::sourceUnavailable, this, &MainWindow::onSourceUnavailable);
     connect(pauseResumeButton_, &QPushButton::clicked, this, &MainWindow::onPauseResumeClicked);
+    connect(addFolderButton_, &QPushButton::clicked, this, &MainWindow::onAddFolderClicked);
     connect(excludeMasksEdit_, &QLineEdit::editingFinished, this, &MainWindow::onExcludeMasksEdited);
 
     {
@@ -137,6 +147,7 @@ void MainWindow::populateVolumes() {
 
     const auto knownRoots = indexManager_->knownRoots();
     const std::set<std::string> knownRootsStd(knownRoots.begin(), knownRoots.end());
+    QSet<QString> addedRoots;
 
     std::vector<datasearch::platform::VolumeInfo> volumes;
     try {
@@ -168,15 +179,30 @@ void MainWindow::populateVolumes() {
                                   .arg(freeGb, 0, 'f', 1)
                                   .arg(totalGb, 0, 'f', 1);
 
-        auto* item = new QListWidgetItem(text, volumeList_);
-        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
         // Sources reopened from a previous session (ТЗ п.13.1) start checked,
         // so their already-indexed results show up without the user having
         // to re-select them.
         const bool known = knownRootsStd.count(volume.rootPath) != 0;
-        item->setCheckState(known ? Qt::Checked : Qt::Unchecked);
-        item->setData(Qt::UserRole, root);
+        addSourceItem(root, text, known);
+        addedRoots.insert(root);
     }
+
+    // Manually added folders (see onAddFolderClicked) don't show up in
+    // enumerateVolumes(), but if one was indexed in a previous session it
+    // should still be offered — otherwise its index becomes unreachable
+    // from the UI after a restart even though the data is still there.
+    for (const auto& root : knownRootsStd) {
+        const QString qRoot = QString::fromStdString(root);
+        if (addedRoots.contains(qRoot)) continue;
+        addSourceItem(qRoot, qRoot, /*checked=*/true);
+    }
+}
+
+void MainWindow::addSourceItem(const QString& root, const QString& text, bool checked) {
+    auto* item = new QListWidgetItem(text, volumeList_);
+    item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+    item->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
+    item->setData(Qt::UserRole, root);
 }
 
 QStringList MainWindow::checkedRoots() const {
@@ -215,9 +241,24 @@ void MainWindow::runSearch() {
     query.limit = 500;
     query.offset = 0;
 
-    auto results = indexManager_->search(query, stdRoots);
-    statusLabel_->setText(tr("Найдено файлов: %1").arg(results.size()));
-    resultsModel_->setRecords(std::move(results));
+    statusLabel_->setText(tr("Идёт поиск..."));
+
+    // Runs off the GUI thread (ТЗ NFR-7) — a broad query (e.g. a single
+    // character) against a large index can take a while; without this the
+    // whole window would freeze until it finished.
+    const QString requestText = searchEdit_->text();
+    const QStringList requestRoots = roots;
+    indexManager_->searchAsync(
+        query, stdRoots, this,
+        [this, requestText, requestRoots](std::vector<datasearch::core::FileRecord> results) {
+            // The user may have kept typing (or changed the selected
+            // sources) while this search was running — a newer runSearch()
+            // call already queued a fresher request, so these results are
+            // stale; drop them rather than briefly flashing outdated data.
+            if (searchEdit_->text() != requestText || checkedRoots() != requestRoots) return;
+            statusLabel_->setText(tr("Найдено файлов: %1").arg(results.size()));
+            resultsModel_->setRecords(std::move(results));
+        });
 }
 
 void MainWindow::onIndexSelectedClicked() {
@@ -345,4 +386,22 @@ void MainWindow::onPauseResumeClicked() {
         pauseResumeButton_->setText(tr("Продолжить"));
         statusLabel_->setText(tr("Индексация приостановлена"));
     }
+}
+
+void MainWindow::onAddFolderClicked() {
+    const QString dir =
+        QFileDialog::getExistingDirectory(this, tr("Выбрать папку для индексации"), QDir::homePath());
+    if (dir.isEmpty()) return;
+
+    for (int i = 0; i < volumeList_->count(); ++i) {
+        QListWidgetItem* item = volumeList_->item(i);
+        if (item->data(Qt::UserRole).toString() == dir) {
+            item->setCheckState(Qt::Checked);
+            runSearch();
+            return;
+        }
+    }
+
+    addSourceItem(dir, dir, /*checked=*/true);
+    runSearch();
 }

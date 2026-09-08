@@ -19,3 +19,13 @@ target_link_libraries(datasearch_app PRIVATE
   datasearch_core
   datasearch_platform
 )
+
+if(APPLE)
+  # A real .app bundle (not a bare executable) so macdeployqt can bundle Qt's
+  # frameworks into it for standalone distribution (see .github/workflows).
+  set_target_properties(datasearch_app PROPERTIES
+    MACOSX_BUNDLE TRUE
+    MACOSX_BUNDLE_BUNDLE_NAME "DataSearch"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.datasearch.app"
+  )
+endif()

@@ -39,9 +39,11 @@ private slots:
     void onSourceUnavailable(const QString& rootLabel);
     void onPauseResumeClicked();
     void onExcludeMasksEdited();
+    void onAddFolderClicked();
 
 private:
     void populateVolumes();
+    void addSourceItem(const QString& root, const QString& text, bool checked);
     QStringList checkedRoots() const;
     void openRow(int row);
     void showRowInFolder(int row);
@@ -61,5 +63,6 @@ private:
     QLabel* statusLabel_ = nullptr;
     QPushButton* indexButton_ = nullptr;
     QPushButton* pauseResumeButton_ = nullptr;
+    QPushButton* addFolderButton_ = nullptr;
     QTimer searchDebounce_;
 };

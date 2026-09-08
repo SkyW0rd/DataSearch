@@ -9,6 +9,9 @@
 #include <QString>
 #include <QTimer>
 
+#include <functional>
+#include <optional>
+
 #include <condition_variable>
 #include <filesystem>
 #include <map>
@@ -51,9 +54,26 @@ public:
 
     // Searches across the indexes for the given roots (only those that have
     // already been opened via indexRoots/loadKnownSources — others are
-    // silently skipped).
+    // silently skipped). Runs on the calling thread — blocks it for however
+    // long the query takes (ТЗ NFR-2 targets ≤300мс, but an unbounded query
+    // like a single-character prefix against a huge index can take far
+    // longer). Prefer searchAsync() from the GUI thread; this synchronous
+    // form exists for tests and for searchAsync's own background thread.
     std::vector<datasearch::core::FileRecord> search(const datasearch::core::SearchQuery& query,
                                                        const std::vector<std::string>& roots);
+
+    // Runs the search on a dedicated background thread so the GUI thread is
+    // never blocked (ТЗ NFR-7: "UI отзывчив при любом объёме индекса"),
+    // regardless of how long a particular query takes. `onDone` is delivered
+    // on `context`'s thread via a queued call, and is automatically skipped
+    // (not a dangling-pointer risk) if `context` is destroyed before the
+    // search finishes — pass the requesting widget/object as `context`.
+    // If a newer searchAsync() call arrives before an older one has started
+    // running, the older one is dropped (never executed) — only the latest
+    // query's results are ever delivered, exactly what's needed for
+    // search-as-you-type.
+    void searchAsync(datasearch::core::SearchQuery query, std::vector<std::string> roots, QObject* context,
+                      std::function<void(std::vector<datasearch::core::FileRecord>)> onDone);
 
     // Masks applied to all subsequent full scans, reconciliation passes and
     // live-watch updates (ТЗ FR-8). Does not retroactively re-scan already
@@ -105,6 +125,7 @@ private:
     void watcherThreadMain();
     void applyChange(datasearch::core::IndexStorage& storage, const std::string& root,
                       const std::string& pathUtf8, int kindInt);
+    void searchThreadMain();
 
     datasearch::platform::IPlatformService* platform_ = nullptr;
     std::unique_ptr<datasearch::core::SourceRegistry> registry_;
@@ -128,4 +149,18 @@ private:
     std::map<std::string, std::map<std::string, int>> pendingByRoot_;
     bool stopping_ = false;
     std::thread watcherThread_;
+
+    // Dedicated search worker: always processes only the *latest* pending
+    // request (see searchAsync doc comment above).
+    struct PendingSearch {
+        datasearch::core::SearchQuery query;
+        std::vector<std::string> roots;
+        QObject* context = nullptr;
+        std::function<void(std::vector<datasearch::core::FileRecord>)> onDone;
+    };
+    std::mutex searchMutex_;
+    std::condition_variable searchCv_;
+    std::optional<PendingSearch> pendingSearch_;
+    bool searchStopping_ = false;
+    std::thread searchThread_;
 };

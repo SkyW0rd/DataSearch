@@ -212,29 +212,64 @@ std::optional<std::vector<std::uint8_t>> readWholeFile(const std::filesystem::pa
     return buffer;
 }
 
+// Finds the next occurrence of any of several fixed patterns in `haystack`,
+// caching each pattern's last-found position so a pattern that's rare (or
+// absent) in the remainder of a large document is only searched for once
+// per "leg" instead of being rescanned to the end on every single call.
+// Without this, a loop that calls plain std::string::find for N patterns on
+// every one of M matches degrades to O(N*len) per call whenever a pattern
+// doesn't occur again — O(len²) overall on a large real-world document (this
+// is exactly what made extraction hang on some real .docx/.xlsx files: any
+// tag that's rare in one particular document, like <w:tab> or a bare <c>
+// with no attributes, turned every remaining iteration into a full rescan
+// of the rest of the file).
+class MultiFind {
+public:
+    MultiFind(const std::string& haystack, std::initializer_list<std::string> patterns) : haystack_(haystack) {
+        for (const auto& p : patterns) cursors_.push_back({p, haystack_.find(p, 0)});
+    }
+
+    // Returns the index into the original pattern list and the position of
+    // the earliest match at or after `pos`, or {-1, npos} if none remain.
+    std::pair<int, std::size_t> next(std::size_t pos) {
+        int bestIdx = -1;
+        std::size_t bestPos = std::string::npos;
+        for (std::size_t i = 0; i < cursors_.size(); ++i) {
+            Cursor& c = cursors_[i];
+            if (c.pos != std::string::npos && c.pos < pos) {
+                c.pos = haystack_.find(c.pattern, pos);
+            }
+            if (c.pos != std::string::npos && (bestIdx == -1 || c.pos < bestPos)) {
+                bestIdx = static_cast<int>(i);
+                bestPos = c.pos;
+            }
+        }
+        return {bestIdx, bestPos};
+    }
+
+private:
+    struct Cursor {
+        std::string pattern;
+        std::size_t pos;
+    };
+    const std::string& haystack_;
+    std::vector<Cursor> cursors_;
+};
+
 // ---------------------------------------------------------------------------
 // DOCX: text runs from word/document.xml.
 // ---------------------------------------------------------------------------
 
 std::string extractDocxBody(const std::string& xml) {
     std::string out;
+    MultiFind finder(xml, {"<w:t", "</w:p>", "<w:tab", "<w:br"});
     std::size_t pos = 0;
     while (pos < xml.size()) {
-        const std::size_t tPos = xml.find("<w:t", pos);
-        const std::size_t pEndPos = xml.find("</w:p>", pos);
-        const std::size_t tabPos = xml.find("<w:tab", pos);
-        const std::size_t brPos = xml.find("<w:br", pos);
+        const auto [idx, next] = finder.next(pos);
+        if (idx == -1) break;
 
-        std::size_t next = std::string::npos;
-        for (std::size_t candidate : {tPos, pEndPos, tabPos, brPos}) {
-            if (candidate != std::string::npos && (next == std::string::npos || candidate < next)) {
-                next = candidate;
-            }
-        }
-        if (next == std::string::npos) break;
-
-        if (next == tPos) {
-            const std::size_t gt = xml.find('>', tPos);
+        if (idx == 0) {  // <w:t
+            const std::size_t gt = xml.find('>', next);
             if (gt == std::string::npos) break;
             const bool selfClosing = gt > 0 && xml[gt - 1] == '/';
             if (selfClosing) { pos = gt + 1; continue; }
@@ -242,17 +277,17 @@ std::string extractDocxBody(const std::string& xml) {
             if (closeTag == std::string::npos) { pos = gt + 1; continue; }
             out += decodeXmlEntities(xml.substr(gt + 1, closeTag - gt - 1));
             pos = closeTag + 6;
-        } else if (next == pEndPos) {
+        } else if (idx == 1) {  // </w:p>
             out += '\n';
-            pos = pEndPos + 6;
-        } else if (next == tabPos) {
+            pos = next + 6;
+        } else if (idx == 2) {  // <w:tab
             out += '\t';
-            const std::size_t gt = xml.find('>', tabPos);
-            pos = (gt == std::string::npos) ? tabPos + 6 : gt + 1;
-        } else {
+            const std::size_t gt = xml.find('>', next);
+            pos = (gt == std::string::npos) ? next + 6 : gt + 1;
+        } else {  // <w:br
             out += '\n';
-            const std::size_t gt = xml.find('>', brPos);
-            pos = (gt == std::string::npos) ? brPos + 5 : gt + 1;
+            const std::size_t gt = xml.find('>', next);
+            pos = (gt == std::string::npos) ? next + 5 : gt + 1;
         }
     }
     return out;
@@ -264,12 +299,11 @@ std::string extractDocxBody(const std::string& xml) {
 
 std::vector<std::string> parseSharedStrings(const std::string& xml) {
     std::vector<std::string> result;
+    MultiFind finder(xml, {"<si>", "<si "});
     std::size_t pos = 0;
     while (true) {
-        const std::size_t a = xml.find("<si>", pos);
-        const std::size_t b = xml.find("<si ", pos);
-        const std::size_t start = std::min(a, b);
-        if (start == std::string::npos) break;
+        const auto [idx, start] = finder.next(pos);
+        if (idx == -1) break;
         const std::size_t gt = xml.find('>', start);
         const std::size_t siEnd = xml.find("</si>", gt);
         if (gt == std::string::npos || siEnd == std::string::npos) break;
@@ -297,12 +331,11 @@ std::vector<std::string> parseSharedStrings(const std::string& xml) {
 
 std::string extractSheetText(const std::string& xml, const std::vector<std::string>& sharedStrings) {
     std::string out;
+    MultiFind finder(xml, {"<c ", "<c>"});
     std::size_t pos = 0;
     while (true) {
-        const std::size_t a = xml.find("<c ", pos);
-        const std::size_t b = xml.find("<c>", pos);
-        const std::size_t start = std::min(a, b);
-        if (start == std::string::npos) break;
+        const auto [idx, start] = finder.next(pos);
+        if (idx == -1) break;
         const std::size_t gt = xml.find('>', start);
         if (gt == std::string::npos) break;
 
@@ -448,16 +481,71 @@ void parseToUnicodeCMap(const std::string& text, std::unordered_map<std::uint32_
     parseBfRange(text, out);
 }
 
-std::string decodeShown(const std::string& bytes, const std::unordered_map<std::uint32_t, std::string>& cmap) {
-    std::string out;
+struct DecodeAttempt {
+    std::string text;
+    std::size_t hits = 0;   // codes actually found in the ToUnicode map
+    std::size_t total = 0;  // codes attempted
+};
+
+// Interprets `bytes` as single-byte character codes (the common case for
+// simple/custom-encoded fonts).
+DecodeAttempt decodeSingleByte(const std::string& bytes, const std::unordered_map<std::uint32_t, std::string>& cmap) {
+    DecodeAttempt result;
     for (unsigned char b : bytes) {
+        ++result.total;
         const auto it = cmap.find(b);
-        if (it != cmap.end()) { out += it->second; continue; }
-        if (b >= 0x20 && b <= 0x7E) out.push_back(static_cast<char>(b));
+        if (it != cmap.end()) {
+            result.text += it->second;
+            ++result.hits;
+        } else if (b >= 0x20 && b <= 0x7E) {
+            result.text.push_back(static_cast<char>(b));
+        }
         // Unmapped high byte with no CMap entry: dropped rather than guessed,
-        // to avoid polluting the index with mojibake (see header comment).
+        // to avoid polluting the index with mojibake.
     }
-    return out;
+    return result;
+}
+
+// Interprets `bytes` as big-endian 2-byte character codes — how Type0/CID
+// fonts with Identity-H encoding represent text, which is how most modern
+// tools embed non-Latin scripts (Cyrillic included) in a PDF. Unlike the
+// single-byte path, an unmapped 2-byte code has no safe ASCII fallback (a
+// raw code is not a character), so it's simply dropped.
+DecodeAttempt decodeDoubleByte(const std::string& bytes, const std::unordered_map<std::uint32_t, std::string>& cmap) {
+    DecodeAttempt result;
+    for (std::size_t i = 0; i + 1 < bytes.size(); i += 2) {
+        const std::uint32_t code = (static_cast<unsigned char>(bytes[i]) << 8) | static_cast<unsigned char>(bytes[i + 1]);
+        ++result.total;
+        const auto it = cmap.find(code);
+        if (it != cmap.end()) {
+            result.text += it->second;
+            ++result.hits;
+        }
+    }
+    return result;
+}
+
+// Best-effort decode of one shown string. There's no per-run font tracking
+// (see header comment for why), so 1-byte vs 2-byte encoding is picked
+// heuristically per string: 2-byte wins only when it fully resolves against
+// the document's /ToUnicode map and the 1-byte reading doesn't — the
+// signature of Identity-H CID text, which single-byte decoding would
+// otherwise turn into unmapped-byte mojibake or drop entirely.
+std::string decodeShown(const std::string& bytes, const std::unordered_map<std::uint32_t, std::string>& cmap) {
+    if (bytes.empty()) return {};
+    if (cmap.empty()) {
+        // No ToUnicode map anywhere in the document: only ASCII passthrough
+        // is safe to assume.
+        return decodeSingleByte(bytes, cmap).text;
+    }
+
+    const DecodeAttempt oneByte = decodeSingleByte(bytes, cmap);
+    const DecodeAttempt twoByte = bytes.size() >= 2 ? decodeDoubleByte(bytes, cmap) : DecodeAttempt{};
+
+    if (twoByte.total > 0 && twoByte.hits == twoByte.total && oneByte.hits < oneByte.total) {
+        return twoByte.text;
+    }
+    return oneByte.hits >= twoByte.hits ? oneByte.text : twoByte.text;
 }
 
 std::pair<std::string, std::size_t> consumeLiteralString(const std::string& text, std::size_t i) {
