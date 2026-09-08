@@ -49,7 +49,14 @@ bool matchesAnyMask(const std::vector<std::string>& masks, const std::string& na
 
 std::int64_t toEpochSeconds(std::filesystem::file_time_type ftime) {
     using namespace std::chrono;
-    const auto sctp = std::chrono::file_clock::to_sys(ftime);
+    // Avoid file_clock::to_sys(): at least one MSVC preview toolset (used by
+    // GitHub Actions' windows-latest runner as of writing) fails to compile
+    // it, complaining that to_sys isn't a member of the internal clock type
+    // file_clock aliases to. Converting via a now()/now() offset instead only
+    // relies on basic time_point arithmetic, which every standard clock
+    // supports regardless of whether it also defines to_sys/from_sys.
+    const auto sctp = time_point_cast<system_clock::duration>(
+        ftime - std::filesystem::file_time_type::clock::now() + system_clock::now());
     return static_cast<std::int64_t>(duration_cast<seconds>(sctp.time_since_epoch()).count());
 }
 
