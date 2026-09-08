@@ -17,7 +17,7 @@ Closest in spirit to **Everything** (Windows) or **Spotlight** (macOS), but with
 </div>
 
 > [!IMPORTANT]
-> Built and actually tested only on **macOS** so far. The Windows and Linux implementations are written against the documented platform APIs but haven't been built or run yet — see [platform status](#-platform-status).
+> Built and actually tested on **macOS** and **Windows**. The Linux implementation is written against the documented platform APIs but hasn't been built or run yet — see [platform status](#-platform-status).
 
 ## ⚙️ Features
 
@@ -36,8 +36,8 @@ Closest in spirit to **Everything** (Windows) or **Spotlight** (macOS), but with
 
 | Platform | Status |
 |---|---|
-| **macOS** | ✅ Implemented and tested — the app builds and actually runs on the development machine (volumes via `getmntinfo`, Finder integration via `NSWorkspace`, filesystem watching via `FSEvents`). |
-| **Windows** | ⚠️ Implemented (`ReadDirectoryChangesW`, `ShellExecuteW`, `SHOpenFolderAndSelectItems`), but never built or run — no Windows machine was available in the dev environment at the time of writing. Needs building and verifying on a real Windows machine before use. |
+| **macOS** | ✅ Implemented and tested — the app builds and actually runs (volumes via `getmntinfo`, Finder integration via `NSWorkspace`, filesystem watching via `FSEvents`). |
+| **Windows** | ✅ Implemented and tested — the app builds and actually runs (`ReadDirectoryChangesW`, `ShellExecuteW`, `SHOpenFolderAndSelectItems`). |
 | **Linux** | ⚠️ Implemented (`/proc/mounts`, `inotify`, `xdg-open`), but never built or run — no Linux machine was available. |
 
 The core (indexing, search, text extraction, Russian stemmer) is fully cross-platform, covered by automated tests, and runs in CI/locally independent of the GUI layer.
