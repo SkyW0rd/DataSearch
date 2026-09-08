@@ -158,6 +158,10 @@ IndexerOptions IndexManager::makeIndexerOptions() {
     options.onRootUnavailable = [this](const std::filesystem::path& root) {
         emit sourceUnavailable(QString::fromStdString(datasearch::core::pathToUtf8(root)));
     };
+    options.onFileError = [this](const std::string& path, const std::string& what) {
+        emit watcherActivity(QString::fromStdString(path),
+                              tr("Файл пропущен из-за ошибки: %1").arg(QString::fromStdString(what)));
+    };
     return options;
 }
 

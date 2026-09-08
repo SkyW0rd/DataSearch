@@ -169,16 +169,32 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
                         }
                     }
 
-                    std::string content;
-                    const std::string ext = toLowerAscii(record.extension);
-                    if (ContentExtractor::isSupportedExtension(ext)) {
-                        if (auto extracted =
-                                ContentExtractor::extract(pathFromUtf8(record.path), ext, extractionOptions_)) {
-                            content = std::move(*extracted);
+                    // This runs on a plain std::thread, not a Qt or main
+                    // thread — an exception escaping here (a malformed
+                    // DOCX/PDF tripping up the hand-rolled parsers, a SQLite
+                    // error, anything) has no thread to propagate to and
+                    // calls std::terminate(), silently killing the whole
+                    // app. One bad file must not be able to do that: skip it
+                    // and keep indexing the rest.
+                    try {
+                        std::string content;
+                        const std::string ext = toLowerAscii(record.extension);
+                        if (ContentExtractor::isSupportedExtension(ext)) {
+                            if (auto extracted = ContentExtractor::extract(pathFromUtf8(record.path), ext,
+                                                                            extractionOptions_)) {
+                                content = std::move(*extracted);
+                            }
                         }
+
+                        storage_.upsertFile(record, content);
+                    } catch (const std::exception& e) {
+                        if (indexerOptions_.onFileError) indexerOptions_.onFileError(record.path, e.what());
+                        return;
+                    } catch (...) {
+                        if (indexerOptions_.onFileError) indexerOptions_.onFileError(record.path, "unknown error");
+                        return;
                     }
 
-                    storage_.upsertFile(record, content);
                     const std::uint64_t countSnapshot = filesIndexed.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (countSnapshot % effectiveBatchSize == 0) {
                         storage_.commitBatch();

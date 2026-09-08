@@ -54,6 +54,12 @@ struct IndexerOptions {
     // in reconcile mode in particular, its previously-indexed files are left
     // untouched rather than being treated as deleted.
     std::function<void(const std::filesystem::path&)> onRootUnavailable;
+
+    // Called (on a worker thread) when extracting or storing one file throws
+    // — a malformed document, a filesystem-level error mid-read, etc. That
+    // file is skipped (left as-is in the index if it was already there); the
+    // scan continues with the rest. Optional — indexing works without it.
+    std::function<void(const std::string& path, const std::string& what)> onFileError;
 };
 
 // Runs scans of one or more roots on a background thread pool and writes the
