@@ -106,7 +106,7 @@ ScanOptions IndexManager::currentScanOptions() const {
     return options;
 }
 
-IndexerOptions IndexManager::makeIndexerOptions() const {
+IndexerOptions IndexManager::makeIndexerOptions() {
     IndexerOptions options;
     IPlatformService* platform = platform_;
     options.onWorkerThreadStart = [platform]() {

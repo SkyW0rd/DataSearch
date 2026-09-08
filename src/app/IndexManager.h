@@ -97,7 +97,7 @@ private:
     static std::filesystem::path dbPathFor(const std::string& root);
 
     datasearch::core::ScanOptions currentScanOptions() const;
-    datasearch::core::IndexerOptions makeIndexerOptions() const;
+    datasearch::core::IndexerOptions makeIndexerOptions();
 
     // Opens/creates storage+indexer for `root` if not already present.
     datasearch::core::IndexStorage& ensureStorage(const std::string& root);

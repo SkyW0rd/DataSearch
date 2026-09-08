@@ -19,22 +19,21 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(DATASEARCH_BUILD_TESTS "Build unit tests for the platform-independent core" ON)
-option(DATASEARCH_BUILD_APP "Build the Qt desktop application (Windows only)" ON)
+option(DATASEARCH_BUILD_APP "Build the Qt desktop application" ON)
 
 # Platform-independent library: filesystem scanning, SQLite-backed index, search.
 # Builds and is testable on any OS (macOS during development, Windows for release).
 add_subdirectory(src/core)
 
-# IPlatformService interface + OS-specific implementation.
-# Per ТЗ п.9/12.1: only the Windows implementation is part of the deliverable for
-# stage 1 — no macOS/Linux stub. The interface headers still parse everywhere so
-# code that only depends on the interface can be written/reviewed on any OS.
+# IPlatformService interface + OS-specific implementation. Windows and
+# macOS/Linux (ТЗ этап 6) implementations both live here, selected by CMake
+# per src/platform/CMakeLists.txt.
 add_subdirectory(src/platform)
 
-if(DATASEARCH_BUILD_APP AND WIN32)
+if(DATASEARCH_BUILD_APP AND (WIN32 OR APPLE OR UNIX))
   add_subdirectory(src/app)
 elseif(DATASEARCH_BUILD_APP)
-  message(STATUS "DataSearch app: skipped (Windows-only, see docs/TZ_DataSearch.md п.9/12.1). Building core only on this platform.")
+  message(STATUS "DataSearch app: skipped (no IPlatformService implementation for this OS yet). Building core only.")
 endif()
 
 if(DATASEARCH_BUILD_TESTS)
