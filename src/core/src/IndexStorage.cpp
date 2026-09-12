@@ -188,42 +188,62 @@ void IndexStorage::upsertFile(const FileRecord& record, const std::string& conte
     const bool ownTransaction = !inBatch_;
     if (ownTransaction) beginBatch();
 
-    static const char* kUpsertSql =
-        "INSERT INTO files(path, name, ext, size, created_time, modified_time) "
-        "VALUES(?1, ?2, ?3, ?4, ?5, ?6) "
-        "ON CONFLICT(path) DO UPDATE SET "
-        "  name=excluded.name, ext=excluded.ext, size=excluded.size, "
-        "  created_time=excluded.created_time, modified_time=excluded.modified_time "
-        "RETURNING id;";
-
-    sqlite3_int64 rowId = 0;
+    // Deliberately not one "INSERT ... ON CONFLICT DO UPDATE ... RETURNING":
+    // SQLite runs that statement inside a statement savepoint, and FTS5
+    // flushes its in-memory pending-terms table on every savepoint. The cost
+    // of a flush scales with that table's slot count, which grows to millions
+    // after one huge document and never shrinks — so every later file paid
+    // for it, and indexing slowed ~20x from the first big file onward.
+    sqlite3_int64 rowId = -1;
     {
-        Statement stmt(db_, kUpsertSql);
+        Statement sel(db_, "SELECT id FROM files WHERE path = ?1;");
+        sqlite3_bind_text(sel, 1, record.path.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel) == SQLITE_ROW) rowId = sqlite3_column_int64(sel, 0);
+    }
+
+    auto bindMetadata = [&](sqlite3_stmt* stmt) {
         sqlite3_bind_text(stmt, 1, record.path.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, record.name.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 3, record.extension.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(record.size));
         sqlite3_bind_int64(stmt, 5, static_cast<sqlite3_int64>(record.createdTime));
         sqlite3_bind_int64(stmt, 6, static_cast<sqlite3_int64>(record.modifiedTime));
+    };
 
-        if (sqlite3_step(stmt) != SQLITE_ROW) {
-            throw std::runtime_error(std::string("Failed to upsert file: ") + sqlite3_errmsg(db_));
+    if (rowId >= 0) {
+        {
+            Statement upd(db_,
+                          "UPDATE files SET path=?1, name=?2, ext=?3, size=?4, created_time=?5, modified_time=?6 "
+                          "WHERE id=?7;");
+            bindMetadata(upd);
+            sqlite3_bind_int64(upd, 7, rowId);
+            if (sqlite3_step(upd) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to update file: ") + sqlite3_errmsg(db_));
+            }
         }
-        rowId = sqlite3_column_int64(stmt, 0);
-    }
-
-    {
-        // Self-contained FTS5 table, kept in sync manually: drop any previous
-        // row for this id, then re-insert with the current name/content.
+        // Self-contained FTS5 table, kept in sync manually: drop the previous
+        // row for this id before re-inserting the current name/content.
         Statement del(db_, "DELETE FROM files_fts WHERE rowid = ?1;");
         sqlite3_bind_int64(del, 1, rowId);
         sqlite3_step(del);
+    } else {
+        Statement ins(db_,
+                      "INSERT INTO files(path, name, ext, size, created_time, modified_time) "
+                      "VALUES(?1, ?2, ?3, ?4, ?5, ?6);");
+        bindMetadata(ins);
+        if (sqlite3_step(ins) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("Failed to insert file: ") + sqlite3_errmsg(db_));
+        }
+        rowId = sqlite3_last_insert_rowid(db_);
     }
+
     {
         Statement ins(db_, "INSERT INTO files_fts(rowid, name, content) VALUES (?1, ?2, ?3);");
         sqlite3_bind_int64(ins, 1, rowId);
         sqlite3_bind_text(ins, 2, record.name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(ins, 3, content.c_str(), -1, SQLITE_TRANSIENT);
+        // STATIC: `content` outlives this statement, so no need for SQLite to
+        // copy it — for a large document that copy doubled peak memory.
+        sqlite3_bind_text(ins, 3, content.c_str(), -1, SQLITE_STATIC);
         if (sqlite3_step(ins) != SQLITE_DONE) {
             throw std::runtime_error(std::string("Failed to update FTS index: ") + sqlite3_errmsg(db_));
         }
