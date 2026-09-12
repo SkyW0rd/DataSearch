@@ -269,6 +269,19 @@ std::string extractDocxBody(const std::string& xml) {
         if (idx == -1) break;
 
         if (idx == 0) {  // <w:t
+            // "<w:t" is also the prefix of the table markup — <w:tbl>, <w:tc>,
+            // <w:tr>, <w:tblPr> — and of <w:tab/>. Only a real text run, i.e.
+            // "<w:t>" or "<w:t xml:space=...>", may be read as text: for any
+            // other tag the span up to the next "</w:t>" is raw XML, which
+            // used to be dumped into the index verbatim.
+            const char after = next + 4 < xml.size() ? xml[next + 4] : '\0';
+            const bool isTextRun = after == '>' || after == '/' || after == ' ' || after == '\t' ||
+                                    after == '\r' || after == '\n';
+            if (!isTextRun) {
+                pos = next + 4;
+                continue;
+            }
+
             const std::size_t gt = xml.find('>', next);
             if (gt == std::string::npos) break;
             const bool selfClosing = gt > 0 && xml[gt - 1] == '/';
@@ -527,33 +540,67 @@ DecodeAttempt decodeDoubleByte(const std::string& bytes, const PdfCMap& cmap) {
     return result;
 }
 
+// Share of a reading's codes that the map actually resolved. Candidate
+// readings must be compared on this rather than on raw hit counts: the
+// 1-byte reading walks twice as many codes as the 2-byte one over the same
+// bytes, so by raw count a wrong font's partial 1-byte match (say 12 of 20
+// bytes) outscores the right font's *perfect* 2-byte match (10 of 10 codes).
+// That is what decoded Identity-H CID text a byte at a time, with its
+// giveaway of every other character coming out identical.
+double decodeCoverage(const DecodeAttempt& attempt) {
+    if (attempt.total == 0) return 0.0;
+    return static_cast<double>(attempt.hits) / static_cast<double>(attempt.total);
+}
+
 // Best-effort decode of one shown string. There's no per-run font tracking
 // (see header comment for why) — content streams reference fonts only by a
 // resource name like /F1, and resolving that to the font object (and from
 // there to *its* /ToUnicode map) would need a resource-dictionary/object
 // graph this parser doesn't build. So every font's map in the document is
-// tried independently here (each, in turn, both as 1-byte and 2-byte codes —
-// 2-byte only wins when it fully resolves against that map and the 1-byte
-// reading doesn't, the signature of Identity-H CID text), keeping whichever
-// decoding resolves the most codes. Trying maps independently instead of
-// merging them into one (the previous approach) matters because independently
-// subsetted embedded fonts routinely reuse the same low byte values for
-// different characters — merged into a single lookup table, one font's
-// entries silently overwrite another's, corrupting the text of every font
-// but whichever was parsed last into the map.
-std::string decodeShown(const std::string& bytes, const std::vector<PdfCMap>& cmaps) {
+// tried independently here, each as both 1-byte and 2-byte codes, keeping
+// whichever reading resolves the largest share of its codes. Trying maps
+// independently instead of merging them into one (the original approach)
+// matters because independently subsetted embedded fonts routinely reuse the
+// same low byte values for different characters — merged into a single lookup
+// table, one font's entries silently overwrite another's, corrupting the text
+// of every font but whichever was parsed last into the map.
+bool isBetterDecode(const DecodeAttempt& candidate, const DecodeAttempt& incumbent) {
+    const double candidateCoverage = decodeCoverage(candidate);
+    const double incumbentCoverage = decodeCoverage(incumbent);
+    if (candidateCoverage != incumbentCoverage) return candidateCoverage > incumbentCoverage;
+    return candidate.hits > incumbent.hits;  // same share resolved: prefer the longer text
+}
+
+// Keeps whichever of `cmap`'s two readings beats the incumbent `best`.
+void considerCmapReadings(const std::string& bytes, const PdfCMap& cmap, DecodeAttempt& best) {
+    DecodeAttempt oneByte = decodeSingleByte(bytes, cmap);
+    if (oneByte.hits > 0 && isBetterDecode(oneByte, best)) best = std::move(oneByte);
+
+    if (bytes.size() >= 2) {
+        DecodeAttempt twoByte = decodeDoubleByte(bytes, cmap);
+        // A map that resolves nothing must never displace the ASCII baseline:
+        // the 2-byte reading drops every unresolved code, so accepting it
+        // would silently erase legitimate ASCII text.
+        if (twoByte.hits > 0 && isBetterDecode(twoByte, best)) best = std::move(twoByte);
+    }
+}
+
+std::string decodeShown(const std::string& bytes, const PdfCMap* activeFont, const std::vector<PdfCMap>& cmaps) {
     if (bytes.empty()) return {};
 
     static const PdfCMap kEmptyCmap;
     DecodeAttempt best = decodeSingleByte(bytes, kEmptyCmap);  // ASCII-only baseline, 0 hits
 
-    for (const PdfCMap& cmap : cmaps) {
-        const DecodeAttempt oneByte = decodeSingleByte(bytes, cmap);
-        const DecodeAttempt twoByte = bytes.size() >= 2 ? decodeDoubleByte(bytes, cmap) : DecodeAttempt{};
-        const DecodeAttempt& candidate =
-            (twoByte.total > 0 && twoByte.hits == twoByte.total && oneByte.hits < oneByte.total) ? twoByte : oneByte;
-        if (candidate.hits > best.hits) best = candidate;
+    if (activeFont != nullptr) {
+        // The Tf operator named a font we resolved to this map, so there is
+        // nothing to guess: only its readings are admissible. Guessing here is
+        // what mixed up text between fonts, since a wrong font's map can score
+        // well on codes it was never meant to decode.
+        considerCmapReadings(bytes, *activeFont, best);
+        return best.text;
     }
+
+    for (const PdfCMap& cmap : cmaps) considerCmapReadings(bytes, cmap, best);
     return best.text;
 }
 
@@ -625,7 +672,14 @@ std::pair<std::string, std::size_t> consumeHexString(const std::string& text, st
     return {raw, j};
 }
 
-std::string scanContentStreamText(const std::string& text, const std::vector<PdfCMap>& cmaps) {
+// `fontsByName` maps this stream's font resource names (what Tf selects, e.g.
+// "F1") to the /ToUnicode map of the font each one actually refers to. When a
+// name resolves, that font's map alone decodes the text it shows; `cmaps` is
+// the fallback for streams whose resources couldn't be resolved, where every
+// map in the document gets tried and the best-resolving reading wins.
+std::string scanContentStreamText(const std::string& text,
+                                    const std::unordered_map<std::string, const PdfCMap*>& fontsByName,
+                                    const std::vector<PdfCMap>& cmaps) {
     struct Chunk {
         bool isGap;
         std::string bytes;
@@ -635,10 +689,13 @@ std::string scanContentStreamText(const std::string& text, const std::vector<Pdf
     bool inArray = false;
     std::size_t i = 0;
 
+    const PdfCMap* activeFont = nullptr;
+    std::string pendingName;  // most recent /Name, which Tf turns into the active font
+
     auto flush = [&]() {
         for (const auto& chunk : pending) {
             if (chunk.isGap) out += ' ';
-            else out += decodeShown(chunk.bytes, cmaps);
+            else out += decodeShown(chunk.bytes, activeFont, cmaps);
         }
         out += ' ';
         pending.clear();
@@ -671,6 +728,16 @@ std::string scanContentStreamText(const std::string& text, const std::vector<Pdf
                 const double value = std::strtod(text.substr(start, i - start).c_str(), nullptr);
                 if (value < -100.0 || value > 100.0) pending.push_back({true, {}});
             }
+        } else if (c == '/') {
+            // A resource name. Only Tf consumes one here, but any name has to
+            // be recognized as a single token so its letters aren't mistaken
+            // for an operator.
+            const std::size_t start = ++i;
+            while (i < text.size() && (std::isalnum(static_cast<unsigned char>(text[i])) || text[i] == '_' ||
+                                        text[i] == '+' || text[i] == '-' || text[i] == '.')) {
+                ++i;
+            }
+            pendingName.assign(text, start, i - start);
         } else if (std::isalpha(static_cast<unsigned char>(c)) || c == '\'' || c == '"') {
             const std::size_t start = i;
             while (i < text.size() && (std::isalnum(static_cast<unsigned char>(text[i])) || text[i] == '*')) ++i;
@@ -681,6 +748,12 @@ std::string scanContentStreamText(const std::string& text, const std::vector<Pdf
             } else if (token == "TJ") {
                 flush();
             } else {
+                if (token == "Tf") {
+                    // "/F1 12 Tf" — switch fonts. An unresolved name leaves no
+                    // active font, which falls back to trying every map.
+                    const auto it = fontsByName.find(pendingName);
+                    activeFont = it == fontsByName.end() ? nullptr : it->second;
+                }
                 pending.clear();
             }
         } else {
@@ -694,15 +767,37 @@ bool isPdfDigit(char c) { return c >= '0' && c <= '9'; }
 bool isPdfSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\0'; }
 bool isPdfWordChar(char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; }
 
+// Reads a run of digits at `i`, advancing it past them. False (leaving `i`
+// alone) when there are no digits there or the value overflows.
+bool readPdfUint(std::string_view text, std::size_t& i, std::uint32_t& out) {
+    std::size_t j = i;
+    std::uint32_t value = 0;
+    while (j < text.size() && isPdfDigit(text[j])) {
+        if (value > 429496728u) return false;  // would overflow on this digit
+        value = value * 10 + static_cast<std::uint32_t>(text[j] - '0');
+        ++j;
+    }
+    if (j == i) return false;
+    i = j;
+    out = value;
+    return true;
+}
+
+struct PdfObjectSpan {
+    std::uint32_t number = 0;  // the "12" of "12 0 obj", for resolving "12 0 R" references
+    std::size_t start = 0;
+    std::size_t end = 0;
+};
+
 // Finds "<num> <gen> obj" headers without std::regex: MSVC's <regex> engine
 // backtracks recursively, and running it (via sregex_iterator/kObjRe, as this
 // used to) over a multi-megabyte PDF buffer risks a native stack overflow —
 // a real crash on large real-world PDFs, not a C++ exception, so it can't be
 // caught and skipped like other per-file errors. The lookback per "obj" hit
 // is capped since real object headers are a handful of characters.
-std::vector<std::pair<std::size_t, std::size_t>> findPdfObjectSpans(std::string_view text) {
+std::vector<PdfObjectSpan> findPdfObjectSpans(std::string_view text) {
     constexpr std::size_t kMaxHeaderLookback = 32;
-    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    std::vector<PdfObjectSpan> spans;
     std::size_t searchPos = 0;
     while (true) {
         const std::size_t objPos = text.find("obj", searchPos);
@@ -726,7 +821,18 @@ std::vector<std::pair<std::size_t, std::size_t>> findPdfObjectSpans(std::string_
 
         const std::size_t endObj = text.find("endobj", afterObj);
         if (endObj == std::string_view::npos) continue;
-        spans.emplace_back(numStart, endObj);
+
+        // 0 means "no usable number": PDF numbers objects from 1, so nothing
+        // will resolve against it. That happens when the digits run longer
+        // than an object number plausibly can — in a file whose binary
+        // stream data happens to look like digits, the backward scan above
+        // swallows some of it. The span itself is still good, and its text
+        // still gets extracted; only font resolution falls back to guessing.
+        std::uint32_t number = 0;
+        std::size_t digits = numStart;
+        if (!readPdfUint(text, digits, number) || digits != numEnd) number = 0;
+
+        spans.push_back({number, numStart, endObj});
     }
     return spans;
 }
@@ -766,6 +872,145 @@ std::optional<std::size_t> parsePdfDirectLength(std::string_view dictText) {
     }
 }
 
+// Reads an indirect reference ("12 0 R") at `i`, advancing past it on success.
+bool readPdfIndirectRef(std::string_view text, std::size_t& i, std::uint32_t& out) {
+    std::size_t j = i;
+    std::uint32_t number = 0;
+    if (!readPdfUint(text, j, number)) return false;
+    while (j < text.size() && isPdfSpace(text[j])) ++j;
+    std::uint32_t generation = 0;
+    if (!readPdfUint(text, j, generation)) return false;
+    while (j < text.size() && isPdfSpace(text[j])) ++j;
+    if (j >= text.size() || text[j] != 'R') return false;
+    if (j + 1 < text.size() && isPdfWordChar(text[j + 1])) return false;  // "RG", not "R"
+    i = j + 1;
+    out = number;
+    return true;
+}
+
+// Positions `i` just past `key` where it appears as a whole dictionary key
+// (so "/Font" doesn't match "/FontFile"), then past any whitespace.
+std::optional<std::size_t> findPdfDictKey(std::string_view dictText, std::string_view key) {
+    std::size_t pos = 0;
+    while (true) {
+        pos = dictText.find(key, pos);
+        if (pos == std::string_view::npos) return std::nullopt;
+        std::size_t i = pos + key.size();
+        if (i < dictText.size() && isPdfWordChar(dictText[i])) {
+            pos = i;
+            continue;
+        }
+        while (i < dictText.size() && isPdfSpace(dictText[i])) ++i;
+        return i;
+    }
+}
+
+// Object numbers referenced by `key`, covering both the single form
+// ("/Contents 4 0 R") and the array form ("/Contents [4 0 R 7 0 R]").
+std::vector<std::uint32_t> findPdfRefsForKey(std::string_view dictText, std::string_view key) {
+    std::vector<std::uint32_t> refs;
+    const auto found = findPdfDictKey(dictText, key);
+    if (!found) return refs;
+
+    std::size_t i = *found;
+    std::uint32_t number = 0;
+    if (i < dictText.size() && dictText[i] == '[') {
+        ++i;
+        while (i < dictText.size() && dictText[i] != ']') {
+            if (readPdfIndirectRef(dictText, i, number)) {
+                refs.push_back(number);
+            } else {
+                ++i;
+            }
+        }
+    } else if (readPdfIndirectRef(dictText, i, number)) {
+        refs.push_back(number);
+    }
+    return refs;
+}
+
+// Parses "<< /F1 5 0 R /F2 8 0 R >>" starting at `i` into name -> object
+// number pairs.
+std::unordered_map<std::string, std::uint32_t> parsePdfNameRefDict(std::string_view dictText, std::size_t i) {
+    std::unordered_map<std::string, std::uint32_t> fonts;
+    if (i + 1 >= dictText.size() || dictText[i] != '<' || dictText[i + 1] != '<') return fonts;
+    i += 2;
+
+    int depth = 1;
+    while (i < dictText.size() && depth > 0) {
+        if (dictText[i] == '<' && i + 1 < dictText.size() && dictText[i + 1] == '<') {
+            ++depth;
+            i += 2;
+        } else if (dictText[i] == '>' && i + 1 < dictText.size() && dictText[i + 1] == '>') {
+            --depth;
+            i += 2;
+        } else if (dictText[i] == '/' && depth == 1) {
+            const std::size_t nameStart = ++i;
+            while (i < dictText.size() && isPdfWordChar(dictText[i])) ++i;
+            std::string name(dictText.substr(nameStart, i - nameStart));
+            while (i < dictText.size() && isPdfSpace(dictText[i])) ++i;
+            std::uint32_t fontObject = 0;
+            if (!name.empty() && readPdfIndirectRef(dictText, i, fontObject)) {
+                fonts.emplace(std::move(name), fontObject);
+            }
+        } else {
+            ++i;
+        }
+    }
+    return fonts;
+}
+
+// The name value of "/Key /Name", without its slash ("Image" for
+// "/Subtype /Image"). Empty when the key is absent or isn't a name.
+std::string_view pdfNameValue(std::string_view dictText, std::string_view key) {
+    const auto found = findPdfDictKey(dictText, key);
+    if (!found || *found >= dictText.size() || dictText[*found] != '/') return {};
+    std::size_t i = *found + 1;
+    const std::size_t start = i;
+    while (i < dictText.size() && isPdfWordChar(dictText[i])) ++i;
+    return dictText.substr(start, i - start);
+}
+
+// Streams that hold something other than page markup: images, embedded font
+// programs, metadata, object/xref streams. Their bytes are not text, but they
+// are full of incidental parentheses and printable characters, so scanning
+// them for Tj/TJ mines megabytes of noise out of a single screenshot — pixel
+// data decodes into runs like `"""%%%PPP` (one repeat per RGB channel). That
+// noise bloats the index and pollutes search results, so it is skipped.
+bool isNonTextPdfStream(std::string_view dictText) {
+    const std::string_view subtype = pdfNameValue(dictText, "/Subtype");
+    if (subtype == "Image" || subtype == "Type1C" || subtype == "CIDFontType0C" || subtype == "OpenType") {
+        return true;
+    }
+    const std::string_view type = pdfNameValue(dictText, "/Type");
+    if (type == "Metadata" || type == "XRef" || type == "ObjStm" || type == "EmbeddedFile") return true;
+
+    // /Length1 accompanies an embedded font program; the rest are image codecs
+    // (a /Filter value, never a resource name).
+    static constexpr std::string_view kMarkers[] = {"/Length1", "DCTDecode", "JPXDecode", "CCITTFaxDecode",
+                                                     "JBIG2Decode"};
+    for (const std::string_view marker : kMarkers) {
+        if (dictText.find(marker) != std::string_view::npos) return true;
+    }
+    return false;
+}
+
+// The "/Font << ... >>" entry of a resource dictionary — the names here are
+// what a content stream's Tf operator selects a font by.
+std::unordered_map<std::string, std::uint32_t> parsePdfFontResources(std::string_view dictText) {
+    const auto found = findPdfDictKey(dictText, "/Font");
+    if (!found) return {};
+    return parsePdfNameRefDict(dictText, *found);
+}
+
+// The same mapping when /Font is an indirect reference and the font dictionary
+// is therefore an object of its own.
+std::unordered_map<std::string, std::uint32_t> parsePdfFontDictObject(std::string_view dictText) {
+    const std::size_t open = dictText.find("<<");
+    if (open == std::string_view::npos) return {};
+    return parsePdfNameRefDict(dictText, open);
+}
+
 std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBytes) {
     // A view over the raw bytes, not a copy — with ExtractionOptions::maxBytes
     // raised well past its old 20 MB, copying the whole file here would
@@ -774,13 +1019,29 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
     // decoded stream text actually needs to be an owned std::string.
     const std::string_view text(reinterpret_cast<const char*>(rawBytes.data()), rawBytes.size());
 
-    const std::vector<std::pair<std::size_t, std::size_t>> objectSpans = findPdfObjectSpans(text);
+    const std::vector<PdfObjectSpan> objectSpans = findPdfObjectSpans(text);
 
-    std::vector<std::string> streams;
+    struct DecodedStream {
+        std::uint32_t objectNumber = 0;
+        bool isText = true;  // false for images, font programs, metadata
+        std::string content;
+    };
+    std::vector<DecodedStream> streams;
     streams.reserve(objectSpans.size());
-    for (const auto& [start, endPos] : objectSpans) {
-        const std::string_view body = text.substr(start, endPos - start);
+
+    // Dictionaries are kept for every object, stream or not, so that Tf's font
+    // names can be followed through /Resources and /ToUnicode to the map that
+    // actually decodes a given run of text. A signed PDF carries several
+    // revisions of the same object number (each signature appends a new one);
+    // the last one wins, which is the revision the trailer points at.
+    std::unordered_map<std::uint32_t, std::string_view> dictByObject;
+    dictByObject.reserve(objectSpans.size());
+
+    for (const auto& span : objectSpans) {
+        const std::string_view body = text.substr(span.start, span.end - span.start);
         const std::size_t streamKw = body.find("stream");
+        const std::string_view dictText = body.substr(0, streamKw == std::string_view::npos ? body.size() : streamKw);
+        dictByObject[span.number] = dictText;
         if (streamKw == std::string_view::npos) continue;
 
         std::size_t dataStart = streamKw + 6;
@@ -789,7 +1050,6 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
         const std::size_t endStreamPos = body.find("endstream", dataStart);
         if (endStreamPos == std::string_view::npos || endStreamPos < dataStart) continue;
 
-        const std::string_view dictText = body.substr(0, streamKw);
         std::size_t length = endStreamPos - dataStart;
         if (const auto candidate = parsePdfDirectLength(dictText)) {
             if (*candidate <= length) length = *candidate;
@@ -801,31 +1061,96 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
         const std::string_view streamBytes = body.substr(dataStart, length);
         const bool flate = dictText.find("FlateDecode") != std::string_view::npos;
 
+        const bool isText = !isNonTextPdfStream(dictText);
         if (flate) {
             auto decompressed = inflateToString(reinterpret_cast<const unsigned char*>(streamBytes.data()),
                                                  streamBytes.size(), /*rawDeflate=*/false);
-            if (decompressed) streams.push_back(std::move(*decompressed));
+            if (decompressed) streams.push_back({span.number, isText, std::move(*decompressed)});
         } else {
-            streams.emplace_back(streamBytes);
+            streams.push_back({span.number, isText, std::string(streamBytes)});
         }
     }
+
+    auto isCMapStream = [](const std::string& s) {
+        return s.find("beginbfchar") != std::string::npos || s.find("beginbfrange") != std::string::npos;
+    };
 
     // One CMap per font's /ToUnicode stream, kept separate rather than merged
     // — see decodeShown() for why a merged table corrupts multi-font
-    // documents.
+    // documents. `cmaps` is the fallback pool for streams whose fonts can't be
+    // resolved; `cmapByObject` points into it for the ones that can.
     std::vector<PdfCMap> cmaps;
-    for (const auto& s : streams) {
-        if (s.find("beginbfchar") != std::string::npos || s.find("beginbfrange") != std::string::npos) {
-            PdfCMap cmap;
-            parseToUnicodeCMap(s, cmap);
-            if (!cmap.empty()) cmaps.push_back(std::move(cmap));
+    std::unordered_map<std::uint32_t, std::size_t> cmapIndexByObject;
+    for (const auto& stream : streams) {
+        if (!isCMapStream(stream.content)) continue;
+        PdfCMap cmap;
+        parseToUnicodeCMap(stream.content, cmap);
+        if (cmap.empty()) continue;
+        cmapIndexByObject[stream.objectNumber] = cmaps.size();
+        cmaps.push_back(std::move(cmap));
+    }
+
+    // Which page draws which content stream, so a content stream can reach the
+    // page's /Resources. (An appearance or Form XObject stream carries its own
+    // /Resources instead, and is handled without this.)
+    std::unordered_map<std::uint32_t, std::uint32_t> pageByContentStream;
+    for (const auto& [objectNumber, dictText] : dictByObject) {
+        for (const std::uint32_t contentRef : findPdfRefsForKey(dictText, "/Contents")) {
+            pageByContentStream.emplace(contentRef, objectNumber);
         }
     }
 
+    auto cmapForFontObject = [&](std::uint32_t fontObject) -> const PdfCMap* {
+        const auto fontDict = dictByObject.find(fontObject);
+        if (fontDict == dictByObject.end()) return nullptr;
+        for (const std::uint32_t toUnicodeRef : findPdfRefsForKey(fontDict->second, "/ToUnicode")) {
+            const auto index = cmapIndexByObject.find(toUnicodeRef);
+            if (index != cmapIndexByObject.end()) return &cmaps[index->second];
+        }
+        return nullptr;
+    };
+
+    // Font resources live either in the stream's own dictionary (Form XObjects,
+    // annotation appearances) or in the page that draws it, and /Resources
+    // itself may be an indirect reference.
+    auto fontsForStream = [&](std::uint32_t objectNumber) {
+        std::unordered_map<std::string, const PdfCMap*> fonts;
+
+        std::vector<std::string_view> candidateDicts;
+        auto addResourceDicts = [&](std::uint32_t owner) {
+            const auto dict = dictByObject.find(owner);
+            if (dict == dictByObject.end()) return;
+            candidateDicts.push_back(dict->second);
+            for (const std::uint32_t resourcesRef : findPdfRefsForKey(dict->second, "/Resources")) {
+                const auto resources = dictByObject.find(resourcesRef);
+                if (resources != dictByObject.end()) candidateDicts.push_back(resources->second);
+            }
+        };
+
+        addResourceDicts(objectNumber);
+        const auto page = pageByContentStream.find(objectNumber);
+        if (page != pageByContentStream.end()) addResourceDicts(page->second);
+
+        for (const std::string_view dict : candidateDicts) {
+            for (const auto& [name, fontObject] : parsePdfFontResources(dict)) {
+                if (const PdfCMap* cmap = cmapForFontObject(fontObject)) fonts.emplace(name, cmap);
+            }
+            // "/Font 9 0 R": the font dictionary is an object of its own.
+            for (const std::uint32_t fontDictRef : findPdfRefsForKey(dict, "/Font")) {
+                const auto fontDict = dictByObject.find(fontDictRef);
+                if (fontDict == dictByObject.end()) continue;
+                for (const auto& [name, fontObject] : parsePdfFontDictObject(fontDict->second)) {
+                    if (const PdfCMap* cmap = cmapForFontObject(fontObject)) fonts.emplace(name, cmap);
+                }
+            }
+        }
+        return fonts;
+    };
+
     std::string result;
-    for (const auto& s : streams) {
-        if (s.find("beginbfchar") != std::string::npos || s.find("beginbfrange") != std::string::npos) continue;
-        result += scanContentStreamText(s, cmaps);
+    for (const auto& stream : streams) {
+        if (!stream.isText || isCMapStream(stream.content)) continue;
+        result += scanContentStreamText(stream.content, fontsForStream(stream.objectNumber), cmaps);
     }
     if (result.empty()) return std::nullopt;
     return result;

@@ -196,6 +196,33 @@ void runContentExtractorTests() {
         DS_CHECK(contains(*extracted, "\xd0\x92\xd1\x82\xd0\xbe\xd1\x80\xd0\xbe\xd0\xb9"));
     }
 
+    // --- DOCX: table markup must not leak into the text -------------------
+    // "<w:t" is the prefix of <w:tbl>, <w:tc>, <w:tr> and <w:tab/> as well as
+    // of a real <w:t> text run. Matching it loosely made the extractor read
+    // everything up to the next "</w:t>" as text, so a document with tables
+    // (most real ones) had raw XML indexed as its content.
+    {
+        const std::string documentXml =
+            "<?xml version=\"1.0\"?>"
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+            "<w:body><w:tbl><w:tblPr><w:tblW w:w=\"9781\" w:type=\"dxa\"/></w:tblPr>"
+            "<w:tr><w:tc><w:tcPr><w:vAlign w:val=\"center\"/></w:tcPr>"
+            "<w:p><w:r><w:t>Cell text</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+            "<w:p><w:r><w:t>After table</w:t><w:tab/><w:t xml:space=\"preserve\">Tabbed</w:t></w:r></w:p>"
+            "</w:body></w:document>";
+        const auto docxPath = root / "table.docx";
+        writeZip(docxPath, {{"word/document.xml", documentXml}});
+
+        auto extracted = ContentExtractor::extract(docxPath, ".docx");
+        DS_CHECK(extracted.has_value());
+        DS_CHECK(contains(*extracted, "Cell text"));
+        DS_CHECK(contains(*extracted, "After table"));
+        DS_CHECK(contains(*extracted, "Tabbed"));
+        DS_CHECK(!contains(*extracted, "tblPr"));
+        DS_CHECK(!contains(*extracted, "dxa"));
+        DS_CHECK(!contains(*extracted, "w:val"));
+    }
+
     // --- XLSX (shared strings + inline string cell) ------------------------
     {
         const std::string sharedStrings =
@@ -310,6 +337,35 @@ void runContentExtractorTests() {
         DS_CHECK(extracted.has_value());
         // "ВГ" (Cyrillic В, Г) via the 2-byte CMap lookup.
         DS_CHECK(contains(*extracted, "\xd0\x92\xd0\x93"));
+    }
+
+    // --- PDF: image/font streams must not be mined for "text" --------------
+    // Pixel data and embedded font programs are binary, but binary is full of
+    // incidental parentheses, so scanning them for Tj/TJ pulled megabytes of
+    // noise (runs like `"""%%%PPP`, one repeat per RGB channel) out of a
+    // single screenshot and into the index.
+    {
+        const std::string pdf =
+            "%PDF-1.4\n"
+            "1 0 obj\n<< /Type /Page >>\nstream\n"
+            "BT /F1 12 Tf 72 700 Td (Real page text) Tj ET\n"
+            "endstream\nendobj\n"
+            "2 0 obj\n<< /Type /XObject /Subtype /Image /Width 4 /Height 4 >>\nstream\n"
+            "(IMAGEPIXELS) Tj (MOREPIXELS) Tj\n"
+            "endstream\nendobj\n"
+            "3 0 obj\n<< /Length1 4096 >>\nstream\n"
+            "(FONTPROGRAM) Tj\n"
+            "endstream\nendobj\n"
+            "trailer\n<< /Root 1 0 R >>\n%%EOF\n";
+        const auto path = root / "with_image.pdf";
+        writeFile(path, pdf);
+
+        auto extracted = ContentExtractor::extract(path, ".pdf");
+        DS_CHECK(extracted.has_value());
+        DS_CHECK(contains(*extracted, "Real page text"));
+        DS_CHECK(!contains(*extracted, "IMAGEPIXELS"));
+        DS_CHECK(!contains(*extracted, "MOREPIXELS"));
+        DS_CHECK(!contains(*extracted, "FONTPROGRAM"));
     }
 
     // --- PDF: object scan tolerates megabytes of digit/whitespace noise ----
