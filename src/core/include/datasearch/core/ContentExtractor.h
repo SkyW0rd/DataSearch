@@ -22,14 +22,17 @@ struct ExtractionOptions {
 //  - .docx: text runs from word/document.xml inside the zip container.
 //  - .xlsx: cell text from xl/sharedStrings.xml + inline strings in each sheet.
 //  - .pdf: text-showing operators (Tj/TJ/'/") from each stream's content,
-//    after FlateDecode decompression; a /ToUnicode CMap (bfchar/bfrange) is
-//    applied when present. This is NOT a full PDF engine: it does not track
-//    per-run font selection, so 1-byte vs 2-byte (Identity-H/CID — the most
-//    common way modern tools embed Cyrillic in a PDF) character codes are
-//    told apart heuristically per shown string, by trying both against the
-//    document's /ToUnicode map and keeping whichever fully resolves — this
-//    handles the common single-font-per-run case correctly but can mismatch
-//    a document that mixes 1-byte and 2-byte fonts within one short string.
+//    after FlateDecode decompression; each font's /ToUnicode CMap (bfchar/
+//    bfrange) is applied when present. This is NOT a full PDF engine: it does
+//    not track per-run font selection (no resource-dictionary/object-graph
+//    parsing, so a /F1 name in a content stream can't be resolved to the
+//    font object that declared it), so per shown string it tries every
+//    font's CMap found in the document, each as both 1-byte and 2-byte
+//    (Identity-H/CID — the most common way modern tools embed Cyrillic in a
+//    PDF) codes, and keeps whichever decoding resolves the most characters.
+//    This handles the common case correctly, including documents that use
+//    several different fonts, but can still mismatch a string whose byte
+//    codes happen to resolve under more than one font's CMap.
 //    Encrypted/password-protected PDFs and scanned pages without a text
 //    layer are out of scope (matches ТЗ п.3.1.1).
 // Binary formats with no extractable text return std::nullopt — ТЗ says such

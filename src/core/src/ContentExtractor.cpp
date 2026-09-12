@@ -481,6 +481,8 @@ void parseToUnicodeCMap(const std::string& text, std::unordered_map<std::uint32_
     parseBfRange(text, out);
 }
 
+using PdfCMap = std::unordered_map<std::uint32_t, std::string>;
+
 struct DecodeAttempt {
     std::string text;
     std::size_t hits = 0;   // codes actually found in the ToUnicode map
@@ -489,7 +491,7 @@ struct DecodeAttempt {
 
 // Interprets `bytes` as single-byte character codes (the common case for
 // simple/custom-encoded fonts).
-DecodeAttempt decodeSingleByte(const std::string& bytes, const std::unordered_map<std::uint32_t, std::string>& cmap) {
+DecodeAttempt decodeSingleByte(const std::string& bytes, const PdfCMap& cmap) {
     DecodeAttempt result;
     for (unsigned char b : bytes) {
         ++result.total;
@@ -511,7 +513,7 @@ DecodeAttempt decodeSingleByte(const std::string& bytes, const std::unordered_ma
 // tools embed non-Latin scripts (Cyrillic included) in a PDF. Unlike the
 // single-byte path, an unmapped 2-byte code has no safe ASCII fallback (a
 // raw code is not a character), so it's simply dropped.
-DecodeAttempt decodeDoubleByte(const std::string& bytes, const std::unordered_map<std::uint32_t, std::string>& cmap) {
+DecodeAttempt decodeDoubleByte(const std::string& bytes, const PdfCMap& cmap) {
     DecodeAttempt result;
     for (std::size_t i = 0; i + 1 < bytes.size(); i += 2) {
         const std::uint32_t code = (static_cast<unsigned char>(bytes[i]) << 8) | static_cast<unsigned char>(bytes[i + 1]);
@@ -526,26 +528,33 @@ DecodeAttempt decodeDoubleByte(const std::string& bytes, const std::unordered_ma
 }
 
 // Best-effort decode of one shown string. There's no per-run font tracking
-// (see header comment for why), so 1-byte vs 2-byte encoding is picked
-// heuristically per string: 2-byte wins only when it fully resolves against
-// the document's /ToUnicode map and the 1-byte reading doesn't — the
-// signature of Identity-H CID text, which single-byte decoding would
-// otherwise turn into unmapped-byte mojibake or drop entirely.
-std::string decodeShown(const std::string& bytes, const std::unordered_map<std::uint32_t, std::string>& cmap) {
+// (see header comment for why) — content streams reference fonts only by a
+// resource name like /F1, and resolving that to the font object (and from
+// there to *its* /ToUnicode map) would need a resource-dictionary/object
+// graph this parser doesn't build. So every font's map in the document is
+// tried independently here (each, in turn, both as 1-byte and 2-byte codes —
+// 2-byte only wins when it fully resolves against that map and the 1-byte
+// reading doesn't, the signature of Identity-H CID text), keeping whichever
+// decoding resolves the most codes. Trying maps independently instead of
+// merging them into one (the previous approach) matters because independently
+// subsetted embedded fonts routinely reuse the same low byte values for
+// different characters — merged into a single lookup table, one font's
+// entries silently overwrite another's, corrupting the text of every font
+// but whichever was parsed last into the map.
+std::string decodeShown(const std::string& bytes, const std::vector<PdfCMap>& cmaps) {
     if (bytes.empty()) return {};
-    if (cmap.empty()) {
-        // No ToUnicode map anywhere in the document: only ASCII passthrough
-        // is safe to assume.
-        return decodeSingleByte(bytes, cmap).text;
-    }
 
-    const DecodeAttempt oneByte = decodeSingleByte(bytes, cmap);
-    const DecodeAttempt twoByte = bytes.size() >= 2 ? decodeDoubleByte(bytes, cmap) : DecodeAttempt{};
+    static const PdfCMap kEmptyCmap;
+    DecodeAttempt best = decodeSingleByte(bytes, kEmptyCmap);  // ASCII-only baseline, 0 hits
 
-    if (twoByte.total > 0 && twoByte.hits == twoByte.total && oneByte.hits < oneByte.total) {
-        return twoByte.text;
+    for (const PdfCMap& cmap : cmaps) {
+        const DecodeAttempt oneByte = decodeSingleByte(bytes, cmap);
+        const DecodeAttempt twoByte = bytes.size() >= 2 ? decodeDoubleByte(bytes, cmap) : DecodeAttempt{};
+        const DecodeAttempt& candidate =
+            (twoByte.total > 0 && twoByte.hits == twoByte.total && oneByte.hits < oneByte.total) ? twoByte : oneByte;
+        if (candidate.hits > best.hits) best = candidate;
     }
-    return oneByte.hits >= twoByte.hits ? oneByte.text : twoByte.text;
+    return best.text;
 }
 
 std::pair<std::string, std::size_t> consumeLiteralString(const std::string& text, std::size_t i) {
@@ -616,7 +625,7 @@ std::pair<std::string, std::size_t> consumeHexString(const std::string& text, st
     return {raw, j};
 }
 
-std::string scanContentStreamText(const std::string& text, const std::unordered_map<std::uint32_t, std::string>& cmap) {
+std::string scanContentStreamText(const std::string& text, const std::vector<PdfCMap>& cmaps) {
     struct Chunk {
         bool isGap;
         std::string bytes;
@@ -629,7 +638,7 @@ std::string scanContentStreamText(const std::string& text, const std::unordered_
     auto flush = [&]() {
         for (const auto& chunk : pending) {
             if (chunk.isGap) out += ' ';
-            else out += decodeShown(chunk.bytes, cmap);
+            else out += decodeShown(chunk.bytes, cmaps);
         }
         out += ' ';
         pending.clear();
@@ -801,17 +810,22 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
         }
     }
 
-    std::unordered_map<std::uint32_t, std::string> cmap;
+    // One CMap per font's /ToUnicode stream, kept separate rather than merged
+    // — see decodeShown() for why a merged table corrupts multi-font
+    // documents.
+    std::vector<PdfCMap> cmaps;
     for (const auto& s : streams) {
         if (s.find("beginbfchar") != std::string::npos || s.find("beginbfrange") != std::string::npos) {
+            PdfCMap cmap;
             parseToUnicodeCMap(s, cmap);
+            if (!cmap.empty()) cmaps.push_back(std::move(cmap));
         }
     }
 
     std::string result;
     for (const auto& s : streams) {
         if (s.find("beginbfchar") != std::string::npos || s.find("beginbfrange") != std::string::npos) continue;
-        result += scanContentStreamText(s, cmap);
+        result += scanContentStreamText(s, cmaps);
     }
     if (result.empty()) return std::nullopt;
     return result;
