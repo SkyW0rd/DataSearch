@@ -118,40 +118,53 @@ struct ZipEntry {
     std::uint32_t localHeaderOffset = 0;
 };
 
+// Reads straight from the file by offset rather than loading the whole
+// archive: a DOCX/XLSX is often mostly embedded images (word/media/*,
+// xl/media/*), and only the central directory plus the few XML entries that
+// hold text are ever needed — the image bytes are never read at all.
 class ZipArchive {
 public:
-    bool open(const std::vector<std::uint8_t>& data) {
-        data_ = &data;
-        if (data.size() < 22) return false;
+    bool open(const std::filesystem::path& path) {
+        file_.open(path, std::ios::binary);
+        if (!file_) return false;
+        file_.seekg(0, std::ios::end);
+        const auto end = file_.tellg();
+        if (end < 22) return false;
+        fileSize_ = static_cast<std::uint64_t>(end);
 
-        const std::size_t searchStart = data.size() >= 22 + 65536 ? data.size() - 22 - 65536 : 0;
+        // The end-of-central-directory record is the last 22 bytes, followed
+        // by an archive comment of at most 64 KB.
+        const std::uint64_t tailSize = std::min<std::uint64_t>(fileSize_, 22 + 65535);
+        std::vector<std::uint8_t> tail;
+        if (!readAt(fileSize_ - tailSize, tailSize, tail)) return false;
+
         std::size_t eocd = std::string::npos;
-        std::size_t i = data.size() - 22;
-        while (true) {
-            if (readU32(data, i) == 0x06054b50u) { eocd = i; break; }
-            if (i == searchStart) break;
-            --i;
+        for (std::size_t i = tail.size() - 22;; --i) {
+            if (readU32(tail, i) == 0x06054b50u) { eocd = i; break; }
+            if (i == 0) break;
         }
         if (eocd == std::string::npos) return false;
 
-        const std::uint16_t totalEntries = readU16(data, eocd + 10);
-        const std::uint32_t centralDirOffset = readU32(data, eocd + 16);
+        const std::uint16_t totalEntries = readU16(tail, eocd + 10);
+        const std::uint32_t centralDirSize = readU32(tail, eocd + 12);
+        const std::uint32_t centralDirOffset = readU32(tail, eocd + 16);
+        std::vector<std::uint8_t> dir;
+        if (!readAt(centralDirOffset, centralDirSize, dir)) return false;
 
-        std::size_t pos = centralDirOffset;
+        std::size_t pos = 0;
         for (std::uint16_t n = 0; n < totalEntries; ++n) {
-            if (pos + 46 > data.size() || readU32(data, pos) != 0x02014b50u) return false;
+            if (pos + 46 > dir.size() || readU32(dir, pos) != 0x02014b50u) return false;
 
             ZipEntry entry;
-            entry.method = readU16(data, pos + 10);
-            const std::uint32_t compressedSize = readU32(data, pos + 20);
-            entry.compressedSize = compressedSize;
-            const std::uint16_t nameLen = readU16(data, pos + 28);
-            const std::uint16_t extraLen = readU16(data, pos + 30);
-            const std::uint16_t commentLen = readU16(data, pos + 32);
-            entry.localHeaderOffset = readU32(data, pos + 42);
+            entry.method = readU16(dir, pos + 10);
+            entry.compressedSize = readU32(dir, pos + 20);
+            const std::uint16_t nameLen = readU16(dir, pos + 28);
+            const std::uint16_t extraLen = readU16(dir, pos + 30);
+            const std::uint16_t commentLen = readU16(dir, pos + 32);
+            entry.localHeaderOffset = readU32(dir, pos + 42);
 
-            if (pos + 46 + nameLen > data.size()) return false;
-            entry.name.assign(reinterpret_cast<const char*>(data.data() + pos + 46), nameLen);
+            if (pos + 46 + nameLen > dir.size()) return false;
+            entry.name.assign(reinterpret_cast<const char*>(dir.data() + pos + 46), nameLen);
 
             entries_.push_back(std::move(entry));
             pos += 46 + nameLen + extraLen + commentLen;
@@ -166,35 +179,45 @@ public:
         return names;
     }
 
-    std::optional<std::string> readEntry(const std::string& name) const {
-        if (data_ == nullptr) return std::nullopt;
+    std::optional<std::string> readEntry(const std::string& name) {
         const ZipEntry* entry = nullptr;
         for (const auto& e : entries_) {
             if (e.name == name) { entry = &e; break; }
         }
         if (entry == nullptr) return std::nullopt;
 
-        const auto& data = *data_;
-        const std::size_t lh = entry->localHeaderOffset;
-        if (lh + 30 > data.size() || readU32(data, lh) != 0x04034b50u) return std::nullopt;
+        std::vector<std::uint8_t> header;
+        if (!readAt(entry->localHeaderOffset, 30, header) || readU32(header, 0) != 0x04034b50u) {
+            return std::nullopt;
+        }
+        const std::uint16_t nameLen = readU16(header, 26);
+        const std::uint16_t extraLen = readU16(header, 28);
+        const std::uint64_t dataStart = std::uint64_t{entry->localHeaderOffset} + 30 + nameLen + extraLen;
 
-        const std::uint16_t nameLen = readU16(data, lh + 26);
-        const std::uint16_t extraLen = readU16(data, lh + 28);
-        const std::size_t dataStart = lh + 30 + nameLen + extraLen;
-        if (dataStart + entry->compressedSize > data.size()) return std::nullopt;
-
-        const unsigned char* bytes = data.data() + dataStart;
+        std::vector<std::uint8_t> bytes;
+        if (!readAt(dataStart, entry->compressedSize, bytes)) return std::nullopt;
         if (entry->method == 0) {
-            return std::string(reinterpret_cast<const char*>(bytes), entry->compressedSize);
+            return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }
         if (entry->method == 8) {
-            return inflateToString(bytes, entry->compressedSize, /*rawDeflate=*/true);
+            return inflateToString(bytes.data(), bytes.size(), /*rawDeflate=*/true);
         }
         return std::nullopt;
     }
 
 private:
-    const std::vector<std::uint8_t>* data_ = nullptr;
+    bool readAt(std::uint64_t offset, std::uint64_t size, std::vector<std::uint8_t>& out) {
+        if (offset > fileSize_ || size > fileSize_ - offset) return false;
+        out.resize(static_cast<std::size_t>(size));
+        file_.clear();
+        file_.seekg(static_cast<std::streamoff>(offset));
+        if (size == 0) return true;
+        file_.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(size));
+        return static_cast<std::uint64_t>(file_.gcount()) == size;
+    }
+
+    std::ifstream file_;
+    std::uint64_t fileSize_ = 0;
     std::vector<ZipEntry> entries_;
 };
 
@@ -1023,7 +1046,6 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
 
     struct DecodedStream {
         std::uint32_t objectNumber = 0;
-        bool isText = true;  // false for images, font programs, metadata
         std::string content;
     };
     std::vector<DecodedStream> streams;
@@ -1058,16 +1080,20 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
             --length;
         }
 
+        // Images and font programs never yield text, and they are the bulk of
+        // a PDF — a Flate-compressed screenshot inflates to raw pixels, tens
+        // of MB each. Skipping them before decompression, not after, is what
+        // keeps a picture-heavy PDF from ballooning in RAM.
+        if (isNonTextPdfStream(dictText)) continue;
+
         const std::string_view streamBytes = body.substr(dataStart, length);
         const bool flate = dictText.find("FlateDecode") != std::string_view::npos;
-
-        const bool isText = !isNonTextPdfStream(dictText);
         if (flate) {
             auto decompressed = inflateToString(reinterpret_cast<const unsigned char*>(streamBytes.data()),
                                                  streamBytes.size(), /*rawDeflate=*/false);
-            if (decompressed) streams.push_back({span.number, isText, std::move(*decompressed)});
+            if (decompressed) streams.push_back({span.number, std::move(*decompressed)});
         } else {
-            streams.push_back({span.number, isText, std::string(streamBytes)});
+            streams.push_back({span.number, std::string(streamBytes)});
         }
     }
 
@@ -1149,7 +1175,7 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
 
     std::string result;
     for (const auto& stream : streams) {
-        if (!stream.isText || isCMapStream(stream.content)) continue;
+        if (isCMapStream(stream.content)) continue;
         result += scanContentStreamText(stream.content, fontsForStream(stream.objectNumber), cmaps);
     }
     if (result.empty()) return std::nullopt;
@@ -1180,21 +1206,32 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
     if (ec || fileSize > options.maxBytes) return std::nullopt;
 
     if (extensionLowercase == ".docx") {
-        auto raw = readWholeFile(path);
-        if (!raw) return std::nullopt;
         ZipArchive archive;
-        if (!archive.open(*raw)) return std::nullopt;
+        if (!archive.open(path)) return std::nullopt;
         auto doc = archive.readEntry("word/document.xml");
         if (!doc) return std::nullopt;
         auto body = extractDocxBody(*doc);
+
+        // Headers, footers, footnotes, endnotes and comments are separate
+        // parts with the same <w:t> markup as the main body.
+        for (const auto& name : archive.entryNames()) {
+            const bool extraPart = name.rfind("word/header", 0) == 0 || name.rfind("word/footer", 0) == 0 ||
+                                   name == "word/footnotes.xml" || name == "word/endnotes.xml" ||
+                                   name == "word/comments.xml";
+            if (!extraPart) continue;
+            if (auto part = archive.readEntry(name)) {
+                const std::string text = extractDocxBody(*part);
+                if (text.empty()) continue;
+                if (!body.empty()) body += '\n';
+                body += text;
+            }
+        }
         return body.empty() ? std::nullopt : std::optional<std::string>(std::move(body));
     }
 
     if (extensionLowercase == ".xlsx") {
-        auto raw = readWholeFile(path);
-        if (!raw) return std::nullopt;
         ZipArchive archive;
-        if (!archive.open(*raw)) return std::nullopt;
+        if (!archive.open(path)) return std::nullopt;
 
         std::vector<std::string> sharedStrings;
         if (auto ss = archive.readEntry("xl/sharedStrings.xml")) {
@@ -1219,9 +1256,15 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
         return extractPdfText(*raw);
     }
 
-    auto raw = readWholeFile(path);
-    if (!raw || raw->empty()) return std::nullopt;
-    return std::string(raw->begin(), raw->end());
+    // Straight into the string that gets returned — not via a byte vector,
+    // which would hold a second full copy of a large text file.
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    std::string text(static_cast<std::size_t>(fileSize), '\0');
+    in.read(text.data(), static_cast<std::streamsize>(text.size()));
+    text.resize(static_cast<std::size_t>(in.gcount()));
+    if (text.empty()) return std::nullopt;
+    return text;
 }
 
 } // namespace datasearch::core

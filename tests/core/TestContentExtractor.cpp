@@ -223,6 +223,34 @@ void runContentExtractorTests() {
         DS_CHECK(!contains(*extracted, "w:val"));
     }
 
+    // --- DOCX: headers/footers/footnotes/comments, image ahead of the body --
+    // The archive is read by offset rather than loaded whole, so entries
+    // sitting after a large media file must still be found where the central
+    // directory says they are.
+    {
+        auto wordPart = [](const std::string& root, const std::string& text) {
+            return "<?xml version=\"1.0\"?><w:" + root +
+                   " xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+                   "<w:p><w:r><w:t>" + text + "</w:t></w:r></w:p></w:" + root + ">";
+        };
+        const auto docxPath = root / "parts.docx";
+        writeZip(docxPath, {{"word/media/image1.png", std::string(3 * 1024 * 1024, '\x7f')},
+                            {"word/document.xml", wordPart("document", "Body text")},
+                            {"word/header1.xml", wordPart("hdr", "Header text")},
+                            {"word/footer2.xml", wordPart("ftr", "Footer text")},
+                            {"word/footnotes.xml", wordPart("footnotes", "Footnote text")},
+                            {"word/comments.xml", wordPart("comments", "Comment text")}});
+
+        auto extracted = ContentExtractor::extract(docxPath, ".docx");
+        DS_CHECK(extracted.has_value());
+        DS_CHECK(contains(*extracted, "Body text"));
+        DS_CHECK(contains(*extracted, "Header text"));
+        DS_CHECK(contains(*extracted, "Footer text"));
+        DS_CHECK(contains(*extracted, "Footnote text"));
+        DS_CHECK(contains(*extracted, "Comment text"));
+        DS_CHECK(!contains(*extracted, "\x7f\x7f"));
+    }
+
     // --- XLSX (shared strings + inline string cell) ------------------------
     {
         const std::string sharedStrings =
