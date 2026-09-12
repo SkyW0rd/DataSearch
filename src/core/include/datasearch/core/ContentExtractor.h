@@ -10,7 +10,11 @@ namespace datasearch::core {
 struct ExtractionOptions {
     // Files larger than this are indexed by name/metadata only (ТЗ: избегать
     // непропорциональной нагрузки на RAM/CPU при индексации огромных файлов).
-    std::uint64_t maxBytes = 20ull * 1024 * 1024;
+    // The PDF object-header scan used to be the limiting factor here (a
+    // recursive std::regex that risked a stack overflow on large inputs —
+    // see ContentExtractor.cpp); now that it's a linear manual scan, this can
+    // sit much higher than the old 20 MB without the same risk.
+    std::uint64_t maxBytes = 100ull * 1024 * 1024;
 };
 
 // Best-effort plain-text extraction for the formats required by ТЗ п.3.1.1:

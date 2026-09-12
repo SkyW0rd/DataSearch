@@ -6,7 +6,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
-#include <regex>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -681,58 +681,123 @@ std::string scanContentStreamText(const std::string& text, const std::unordered_
     return out;
 }
 
-std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBytes) {
-    const std::string text(reinterpret_cast<const char*>(rawBytes.data()), rawBytes.size());
+bool isPdfDigit(char c) { return c >= '0' && c <= '9'; }
+bool isPdfSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\0'; }
+bool isPdfWordChar(char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; }
 
-    static const std::regex kObjRe(R"((\d+)\s+(\d+)\s+obj\b)");
-    std::vector<std::pair<std::size_t, std::size_t>> objectSpans;
-    {
-        auto it = std::sregex_iterator(text.begin(), text.end(), kObjRe);
-        const auto end = std::sregex_iterator();
-        for (; it != end; ++it) {
-            const std::size_t start = static_cast<std::size_t>(it->position());
-            const std::size_t endObj = text.find("endobj", start);
-            if (endObj == std::string::npos) continue;
-            objectSpans.emplace_back(start, endObj);
+// Finds "<num> <gen> obj" headers without std::regex: MSVC's <regex> engine
+// backtracks recursively, and running it (via sregex_iterator/kObjRe, as this
+// used to) over a multi-megabyte PDF buffer risks a native stack overflow —
+// a real crash on large real-world PDFs, not a C++ exception, so it can't be
+// caught and skipped like other per-file errors. The lookback per "obj" hit
+// is capped since real object headers are a handful of characters.
+std::vector<std::pair<std::size_t, std::size_t>> findPdfObjectSpans(std::string_view text) {
+    constexpr std::size_t kMaxHeaderLookback = 32;
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    std::size_t searchPos = 0;
+    while (true) {
+        const std::size_t objPos = text.find("obj", searchPos);
+        if (objPos == std::string_view::npos) break;
+        const std::size_t afterObj = objPos + 3;
+        searchPos = afterObj;
+        if (afterObj < text.size() && isPdfWordChar(text[afterObj])) continue;
+
+        const std::size_t lookbackLimit = objPos > kMaxHeaderLookback ? objPos - kMaxHeaderLookback : 0;
+        std::size_t j = objPos;
+        while (j > lookbackLimit && isPdfSpace(text[j - 1])) --j;
+        const std::size_t genEnd = j;
+        while (j > lookbackLimit && isPdfDigit(text[j - 1])) --j;
+        const std::size_t genStart = j;
+        if (genStart == genEnd) continue;
+        while (j > lookbackLimit && isPdfSpace(text[j - 1])) --j;
+        const std::size_t numEnd = j;
+        while (j > lookbackLimit && isPdfDigit(text[j - 1])) --j;
+        const std::size_t numStart = j;
+        if (numStart == numEnd) continue;
+
+        const std::size_t endObj = text.find("endobj", afterObj);
+        if (endObj == std::string_view::npos) continue;
+        spans.emplace_back(numStart, endObj);
+    }
+    return spans;
+}
+
+// Manual replacement for the old `/Length\s+(\d+)(?!\s+\d+\s+R)` regex:
+// a direct integer /Length, rejecting the indirect-reference form ("/Length
+// 5 0 R"). `dictText` is a single object's dictionary, always small, but
+// kept regex-free for consistency with findPdfObjectSpans above.
+std::optional<std::size_t> parsePdfDirectLength(std::string_view dictText) {
+    std::size_t pos = 0;
+    while (true) {
+        pos = dictText.find("/Length", pos);
+        if (pos == std::string_view::npos) return std::nullopt;
+        std::size_t i = pos + 7;
+        while (i < dictText.size() && isPdfSpace(dictText[i])) ++i;
+        const std::size_t numStart = i;
+        while (i < dictText.size() && isPdfDigit(dictText[i])) ++i;
+        if (i == numStart) { pos += 7; continue; }
+        const std::size_t numEnd = i;
+
+        std::size_t j = i;
+        while (j < dictText.size() && isPdfSpace(dictText[j])) ++j;
+        const std::size_t genStart = j;
+        while (j < dictText.size() && isPdfDigit(dictText[j])) ++j;
+        const bool hasGen = j > genStart;
+        std::size_t k = j;
+        while (hasGen && k < dictText.size() && isPdfSpace(dictText[k])) ++k;
+        const bool isIndirect = hasGen && k < dictText.size() && dictText[k] == 'R' &&
+                                 !(k + 1 < dictText.size() && isPdfWordChar(dictText[k + 1]));
+        if (isIndirect) return std::nullopt;
+
+        try {
+            return static_cast<std::size_t>(std::stoul(std::string(dictText.substr(numStart, numEnd - numStart))));
+        } catch (...) {
+            return std::nullopt;
         }
     }
+}
+
+std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBytes) {
+    // A view over the raw bytes, not a copy — with ExtractionOptions::maxBytes
+    // raised well past its old 20 MB, copying the whole file here would
+    // needlessly double peak memory. Every substring derived below (body,
+    // dictText, streamBytes) is a view too, for the same reason; only the
+    // decoded stream text actually needs to be an owned std::string.
+    const std::string_view text(reinterpret_cast<const char*>(rawBytes.data()), rawBytes.size());
+
+    const std::vector<std::pair<std::size_t, std::size_t>> objectSpans = findPdfObjectSpans(text);
 
     std::vector<std::string> streams;
     streams.reserve(objectSpans.size());
     for (const auto& [start, endPos] : objectSpans) {
-        const std::string body = text.substr(start, endPos - start);
+        const std::string_view body = text.substr(start, endPos - start);
         const std::size_t streamKw = body.find("stream");
-        if (streamKw == std::string::npos) continue;
+        if (streamKw == std::string_view::npos) continue;
 
         std::size_t dataStart = streamKw + 6;
         if (dataStart < body.size() && body[dataStart] == '\r') ++dataStart;
         if (dataStart < body.size() && body[dataStart] == '\n') ++dataStart;
         const std::size_t endStreamPos = body.find("endstream", dataStart);
-        if (endStreamPos == std::string::npos || endStreamPos < dataStart) continue;
+        if (endStreamPos == std::string_view::npos || endStreamPos < dataStart) continue;
 
-        const std::string dictText = body.substr(0, streamKw);
+        const std::string_view dictText = body.substr(0, streamKw);
         std::size_t length = endStreamPos - dataStart;
-        {
-            static const std::regex kLenDirectRe(R"(/Length\s+(\d+)(?!\s+\d+\s+R))");
-            std::smatch m;
-            if (std::regex_search(dictText, m, kLenDirectRe)) {
-                const std::size_t candidate = static_cast<std::size_t>(std::stoul(m[1].str()));
-                if (candidate <= length) length = candidate;
-            }
+        if (const auto candidate = parsePdfDirectLength(dictText)) {
+            if (*candidate <= length) length = *candidate;
         }
         while (length > 0 && (body[dataStart + length - 1] == '\n' || body[dataStart + length - 1] == '\r')) {
             --length;
         }
 
-        const std::string streamBytes = body.substr(dataStart, length);
-        const bool flate = dictText.find("FlateDecode") != std::string::npos;
+        const std::string_view streamBytes = body.substr(dataStart, length);
+        const bool flate = dictText.find("FlateDecode") != std::string_view::npos;
 
         if (flate) {
             auto decompressed = inflateToString(reinterpret_cast<const unsigned char*>(streamBytes.data()),
                                                  streamBytes.size(), /*rawDeflate=*/false);
             if (decompressed) streams.push_back(std::move(*decompressed));
         } else {
-            streams.push_back(streamBytes);
+            streams.emplace_back(streamBytes);
         }
     }
 

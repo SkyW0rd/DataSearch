@@ -311,4 +311,35 @@ void runContentExtractorTests() {
         // "ВГ" (Cyrillic В, Г) via the 2-byte CMap lookup.
         DS_CHECK(contains(*extracted, "\xd0\x92\xd0\x93"));
     }
+
+    // --- PDF: object scan tolerates megabytes of digit/whitespace noise ----
+    // The object-header scan used to run std::regex (kObjRe) over the whole
+    // file. MSVC's <regex> backtracks recursively, and on a large real-world
+    // PDF full of digit runs (xref tables, binary streams that happen to look
+    // like ASCII digits) that could blow the stack — a native crash, not a
+    // catchable C++ exception, which is what actually killed the app on
+    // Windows during indexing. The scan is now manual string search instead;
+    // this guards against that regressing.
+    {
+        std::mt19937 rng(42);
+        std::uniform_int_distribution<int> digitDist('0', '9');
+        std::string pdf = "%PDF-1.4\n";
+        std::string noise;
+        noise.reserve(4ull * 1024 * 1024);
+        for (std::size_t i = 0; i < 4ull * 1024 * 1024; ++i) {
+            noise.push_back(i % 37 == 0 ? ' ' : static_cast<char>(digitDist(rng)));
+        }
+        pdf += noise;
+        const std::string streamBody = "BT /F1 12 Tf 72 700 Td (Found after noise) Tj ET\n";
+        pdf += "1 0 obj\n<< /Length " + std::to_string(streamBody.size()) + " >>\nstream\n";
+        pdf += streamBody;
+        pdf += "endstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
+
+        const auto path = root / "noisy_large.pdf";
+        writeBinaryFile(path, pdf);
+
+        auto extracted = ContentExtractor::extract(path, ".pdf");
+        DS_CHECK(extracted.has_value());
+        DS_CHECK(contains(*extracted, "Found after noise"));
+    }
 }
