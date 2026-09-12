@@ -25,6 +25,63 @@ struct IndexProgress {
 using ProgressCallback = std::function<void(const IndexProgress&)>;
 using CompletionCallback = std::function<void(bool cancelled)>;
 
+enum class IndexPhase {
+    Idle,       // never started
+    Counting,   // walking the roots to learn how many files there are
+    Indexing,   // processing files
+    Finishing,  // final commit; when reconciling, also dropping vanished files
+    Finished,
+};
+
+// Point-in-time view of a run for a progress display (see Indexer::status()).
+struct IndexerStatus {
+    IndexPhase phase = IndexPhase::Idle;
+    bool reconcile = false;
+    bool pauseRequested = false;
+    // Pause requested AND every worker has actually stopped — until then the
+    // file in flight is still being finished.
+    bool paused = false;
+    bool cancelRequested = false;
+    bool cancelled = false;  // the run Finished because of cancel()
+
+    // While Counting: files found so far. Afterwards: the total. When
+    // reconciling there is no counting pass and this is the number of files
+    // the index held before the pass — an estimate (`totalIsEstimate`).
+    std::uint64_t filesTotal = 0;
+    bool totalIsEstimate = false;
+    std::uint64_t filesVisited = 0;  // written + unchanged + failed
+    std::uint64_t filesWritten = 0;
+    std::uint64_t filesFailed = 0;
+
+    // Heavy files (IndexerOptions::heavyFileThreshold) are set aside during
+    // the main pass and processed one at a time at the end.
+    // `processingHeavy` is true during that final stretch.
+    std::uint64_t heavyFound = 0;
+    std::uint64_t heavyDone = 0;
+    std::uint64_t heavyBytesTotal = 0;
+    std::uint64_t heavyBytesDone = 0;
+    // The same in expected extracted text, which tracks time far better
+    // than size on disk (an XLSX costs ~6x a text file of equal size).
+    std::uint64_t heavyWorkTotal = 0;
+    std::uint64_t heavyWorkDone = 0;
+    bool processingHeavy = false;
+    // Seconds until the heavy files are done, or -1 while there's no basis
+    // for a forecast yet (before the first one finishes). Paced only by
+    // heavy files already processed, excluding pauses, and counting down
+    // through the file in flight rather than stalling while it runs.
+    double heavySecondsLeft = -1;
+
+    // The file most recently started. `currentInProgress` is false once it's
+    // done and the scan is between files (e.g. walking empty directories).
+    std::string currentPath;
+    std::uint64_t currentSize = 0;
+    bool currentInProgress = false;
+    std::chrono::steady_clock::time_point currentStartedAt;
+
+    std::chrono::steady_clock::time_point startedAt;
+    std::chrono::steady_clock::time_point finishedAt;
+};
+
 struct IndexerOptions {
     // Background-indexing parallelism cap (ТЗ п.12.3: "не более
     // количество_ядер/2, не менее 1 и не более 4"). 0 = pick that default.
@@ -54,6 +111,14 @@ struct IndexerOptions {
     // in reconcile mode in particular, its previously-indexed files are left
     // untouched rather than being treated as deleted.
     std::function<void(const std::filesystem::path&)> onRootUnavailable;
+
+    // Files whose extracted text is expected to exceed this many bytes are
+    // "heavy": skipped in the main pass and indexed one at a time after it.
+    // Everything else becomes searchable first, progress keeps moving instead
+    // of stalling on one document, and only one memory-hungry file is ever in
+    // flight. The estimate is by type and size (see Indexer.cpp). 0 = never
+    // defer.
+    std::uint64_t heavyFileThreshold = 20ull * 1024 * 1024;
 
     // Called (on a worker thread) when extracting or storing one file throws
     // — a malformed document, a filesystem-level error mid-read, etc. That
@@ -113,6 +178,10 @@ public:
 
     bool isRunning() const;
 
+    // Cheap and safe to call from any thread at any time, e.g. from a UI
+    // timer; the last run's final state stays readable after it Finished.
+    IndexerStatus status() const;
+
 private:
     static constexpr std::uint64_t kDefaultBatchSize = 500;
 
@@ -127,7 +196,40 @@ private:
     std::condition_variable pauseCv_;
     std::thread worker_;
 
+    std::atomic<IndexPhase> phase_{IndexPhase::Idle};
+    std::atomic<bool> reconcileMode_{false};
+    std::atomic<bool> finishedCancelled_{false};
+    std::atomic<bool> totalIsEstimate_{false};
+    std::atomic<std::uint64_t> filesTotal_{0};
+    std::atomic<std::uint64_t> filesVisited_{0};
+    std::atomic<std::uint64_t> filesWritten_{0};
+    std::atomic<std::uint64_t> filesFailed_{0};
+    std::atomic<std::size_t> activeWorkers_{0};
+    std::atomic<std::size_t> parkedWorkers_{0};
+    std::atomic<std::uint64_t> heavyFound_{0};
+    std::atomic<std::uint64_t> heavyDone_{0};
+    std::atomic<std::uint64_t> heavyBytesTotal_{0};
+    std::atomic<std::uint64_t> heavyBytesDone_{0};
+    std::atomic<std::uint64_t> heavyWorkTotal_{0};
+    std::atomic<std::uint64_t> heavyWorkDone_{0};
+    std::atomic<std::uint64_t> heavyActiveMs_{0};  // time spent processing finished heavy files
+    std::atomic<std::uint64_t> currentWork_{0};     // expected text of the heavy file in flight
+    std::atomic<bool> processingHeavy_{false};
+
+    mutable std::mutex statusMutex_;  // guards the fields below
+    std::string currentPath_;
+    std::uint64_t currentSize_ = 0;
+    bool currentInProgress_ = false;
+    std::chrono::steady_clock::time_point currentStartedAt_;
+    std::chrono::steady_clock::time_point startedAt_;
+    std::chrono::steady_clock::time_point finishedAt_;
+
+    void launch(std::vector<std::filesystem::path> roots, ProgressCallback onProgress,
+                CompletionCallback onComplete, bool reconcileMode);
     void waitWhilePaused();
+    void beginFile(const std::string& path, std::uint64_t size);
+    void endFile();
+    bool isHeavy(const FileRecord& record) const;
     void runInternal(std::vector<std::filesystem::path> roots,
                       ProgressCallback onProgress,
                       CompletionCallback onComplete,

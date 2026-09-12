@@ -2,6 +2,7 @@
 
 #include <zlib.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdlib>
@@ -115,6 +116,7 @@ struct ZipEntry {
     std::string name;
     std::uint16_t method = 0;
     std::uint32_t compressedSize = 0;
+    std::uint32_t uncompressedSize = 0;
     std::uint32_t localHeaderOffset = 0;
 };
 
@@ -158,6 +160,7 @@ public:
             ZipEntry entry;
             entry.method = readU16(dir, pos + 10);
             entry.compressedSize = readU32(dir, pos + 20);
+            entry.uncompressedSize = readU32(dir, pos + 24);
             const std::uint16_t nameLen = readU16(dir, pos + 28);
             const std::uint16_t extraLen = readU16(dir, pos + 30);
             const std::uint16_t commentLen = readU16(dir, pos + 32);
@@ -170,6 +173,16 @@ public:
             pos += 46 + nameLen + extraLen + commentLen;
         }
         return true;
+    }
+
+    // Unpacked size of the named entries, from the central directory — known
+    // before anything is decompressed.
+    std::uint64_t unpackedSize(const std::vector<std::string>& names) const {
+        std::uint64_t total = 0;
+        for (const auto& e : entries_) {
+            if (std::find(names.begin(), names.end(), e.name) != names.end()) total += e.uncompressedSize;
+        }
+        return total;
     }
 
     std::vector<std::string> entryNames() const {
@@ -283,9 +296,15 @@ private:
 // DOCX: text runs from word/document.xml.
 // ---------------------------------------------------------------------------
 
-std::string extractDocxBody(const std::string& xml) {
+// Text runs of WordprocessingML (prefix "w": <w:t>, paragraphs </w:p>) or of
+// DrawingML (prefix "a": the same shape — <a:t>, </a:p> — used for chart
+// titles and labels, SmartArt, and shapes/text boxes in spreadsheets).
+std::string extractTextRuns(const std::string& xml, const std::string& ns) {
+    const std::string textOpen = "<" + ns + ":t";
+    const std::string textClose = "</" + ns + ":t>";
+    const std::string paraClose = "</" + ns + ":p>";
     std::string out;
-    MultiFind finder(xml, {"<w:t", "</w:p>", "<w:tab", "<w:br"});
+    MultiFind finder(xml, {textOpen, paraClose, "<" + ns + ":tab", "<" + ns + ":br"});
     std::size_t pos = 0;
     while (pos < xml.size()) {
         const auto [idx, next] = finder.next(pos);
@@ -293,15 +312,16 @@ std::string extractDocxBody(const std::string& xml) {
 
         if (idx == 0) {  // <w:t
             // "<w:t" is also the prefix of the table markup — <w:tbl>, <w:tc>,
-            // <w:tr>, <w:tblPr> — and of <w:tab/>. Only a real text run, i.e.
+            // <w:tr>, <w:tblPr> — and of <w:tab/> (likewise <a:tbl>, <a:tc>...). Only a real text run, i.e.
             // "<w:t>" or "<w:t xml:space=...>", may be read as text: for any
-            // other tag the span up to the next "</w:t>" is raw XML, which
+            // other tag the span up to the next closing tag is raw XML, which
             // used to be dumped into the index verbatim.
-            const char after = next + 4 < xml.size() ? xml[next + 4] : '\0';
+            const std::size_t tagEnd = next + textOpen.size();
+            const char after = tagEnd < xml.size() ? xml[tagEnd] : '\0';
             const bool isTextRun = after == '>' || after == '/' || after == ' ' || after == '\t' ||
                                     after == '\r' || after == '\n';
             if (!isTextRun) {
-                pos = next + 4;
+                pos = tagEnd;
                 continue;
             }
 
@@ -309,21 +329,21 @@ std::string extractDocxBody(const std::string& xml) {
             if (gt == std::string::npos) break;
             const bool selfClosing = gt > 0 && xml[gt - 1] == '/';
             if (selfClosing) { pos = gt + 1; continue; }
-            const std::size_t closeTag = xml.find("</w:t>", gt + 1);
+            const std::size_t closeTag = xml.find(textClose, gt + 1);
             if (closeTag == std::string::npos) { pos = gt + 1; continue; }
             out += decodeXmlEntities(xml.substr(gt + 1, closeTag - gt - 1));
-            pos = closeTag + 6;
+            pos = closeTag + textClose.size();
         } else if (idx == 1) {  // </w:p>
             out += '\n';
-            pos = next + 6;
+            pos = next + paraClose.size();
         } else if (idx == 2) {  // <w:tab
             out += '\t';
             const std::size_t gt = xml.find('>', next);
-            pos = (gt == std::string::npos) ? next + 6 : gt + 1;
+            pos = (gt == std::string::npos) ? next + 1 : gt + 1;
         } else {  // <w:br
             out += '\n';
             const std::size_t gt = xml.find('>', next);
-            pos = (gt == std::string::npos) ? next + 5 : gt + 1;
+            pos = (gt == std::string::npos) ? next + 1 : gt + 1;
         }
     }
     return out;
@@ -363,6 +383,59 @@ std::vector<std::string> parseSharedStrings(const std::string& xml) {
         pos = siEnd + 5;
     }
     return result;
+}
+
+// Text of every <t> element (exactly <t> or <t ...>, not <text>, <tabColor>
+// and the like), one per line — cell comments/notes keep their text this way.
+std::string extractTElements(const std::string& xml) {
+    std::string out;
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t open = xml.find("<t", pos);
+        if (open == std::string::npos) break;
+        const char after = open + 2 < xml.size() ? xml[open + 2] : '\0';
+        if (after != '>' && after != ' ') {
+            pos = open + 2;
+            continue;
+        }
+        const std::size_t gt = xml.find('>', open);
+        if (gt == std::string::npos) break;
+        const std::size_t close = xml.find("</t>", gt + 1);
+        if (close == std::string::npos) break;
+        out += decodeXmlEntities(xml.substr(gt + 1, close - gt - 1));
+        out += '\n';
+        pos = close + 4;
+    }
+    return out;
+}
+
+// Sheet names from xl/workbook.xml (<sheet name="..." .../>).
+std::string extractSheetNames(const std::string& xml) {
+    std::string out;
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t open = xml.find("<sheet ", pos);
+        if (open == std::string::npos) break;
+        const std::size_t gt = xml.find('>', open);
+        if (gt == std::string::npos) break;
+        const std::string tag = xml.substr(open, gt - open);
+        const std::size_t nameAttr = tag.find(" name=\"");
+        if (nameAttr != std::string::npos) {
+            const std::size_t valueStart = nameAttr + 7;
+            const std::size_t valueEnd = tag.find('"', valueStart);
+            if (valueEnd != std::string::npos) {
+                out += decodeXmlEntities(tag.substr(valueStart, valueEnd - valueStart));
+                out += '\n';
+            }
+        }
+        pos = gt + 1;
+    }
+    return out;
+}
+
+bool hasPrefixAndXmlSuffix(const std::string& name, const std::string& prefix) {
+    return name.rfind(prefix, 0) == 0 && name.size() > prefix.size() + 4 &&
+           name.compare(name.size() - 4, 4, ".xml") == 0;
 }
 
 std::string extractSheetText(const std::string& xml, const std::vector<std::string>& sharedStrings) {
@@ -414,6 +487,13 @@ std::string extractSheetText(const std::string& xml, const std::vector<std::stri
         } else if (cellType == "inlineStr") {
             if (auto v = extractBetween("<t>", "</t>")) {
                 out += decodeXmlEntities(*v);
+                out += ' ';
+            }
+        } else if (cellType.empty() || cellType == "n" || cellType == "d") {
+            // Numbers (contract numbers, amounts, INNs — searched for as
+            // often as words) and ISO dates; a formula's cached result too.
+            if (auto v = extractBetween("<v>", "</v>")) {
+                out += *v;
                 out += ' ';
             }
         }
@@ -1203,52 +1283,77 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
                                                        const ExtractionOptions& options) {
     std::error_code ec;
     const auto fileSize = std::filesystem::file_size(path, ec);
-    if (ec || fileSize > options.maxBytes) return std::nullopt;
+    if (ec) return std::nullopt;
 
-    if (extensionLowercase == ".docx") {
+    // DOCX/XLSX: only the XML parts that hold text are read; embedded images
+    // (word/media, xl/media) never are, so the limit applies to those parts'
+    // unpacked size — a document that is mostly pictures is indexed in full
+    // however big the file is.
+    if (extensionLowercase == ".docx" || extensionLowercase == ".xlsx") {
         ZipArchive archive;
         if (!archive.open(path)) return std::nullopt;
-        auto doc = archive.readEntry("word/document.xml");
-        if (!doc) return std::nullopt;
-        auto body = extractDocxBody(*doc);
+        const bool docx = extensionLowercase == ".docx";
 
-        // Headers, footers, footnotes, endnotes and comments are separate
-        // parts with the same <w:t> markup as the main body.
+        std::vector<std::string> parts;
         for (const auto& name : archive.entryNames()) {
-            const bool extraPart = name.rfind("word/header", 0) == 0 || name.rfind("word/footer", 0) == 0 ||
-                                   name == "word/footnotes.xml" || name == "word/endnotes.xml" ||
-                                   name == "word/comments.xml";
-            if (!extraPart) continue;
-            if (auto part = archive.readEntry(name)) {
-                const std::string text = extractDocxBody(*part);
-                if (text.empty()) continue;
-                if (!body.empty()) body += '\n';
-                body += text;
-            }
+            const bool wanted =
+                docx ? (name == "word/document.xml" || hasPrefixAndXmlSuffix(name, "word/header") ||
+                        hasPrefixAndXmlSuffix(name, "word/footer") || name == "word/footnotes.xml" ||
+                        name == "word/endnotes.xml" || name == "word/comments.xml" ||
+                        hasPrefixAndXmlSuffix(name, "word/charts/chart") ||
+                        hasPrefixAndXmlSuffix(name, "word/diagrams/data"))
+                     : (name == "xl/workbook.xml" || name == "xl/sharedStrings.xml" ||
+                        hasPrefixAndXmlSuffix(name, "xl/worksheets/sheet") ||
+                        hasPrefixAndXmlSuffix(name, "xl/comments") ||
+                        hasPrefixAndXmlSuffix(name, "xl/drawings/drawing") ||
+                        hasPrefixAndXmlSuffix(name, "xl/charts/chart") ||
+                        hasPrefixAndXmlSuffix(name, "xl/diagrams/data"));
+            if (wanted) parts.push_back(name);
         }
-        return body.empty() ? std::nullopt : std::optional<std::string>(std::move(body));
-    }
+        if (archive.unpackedSize(parts) > options.maxUnpackedBytes) return std::nullopt;
 
-    if (extensionLowercase == ".xlsx") {
-        ZipArchive archive;
-        if (!archive.open(path)) return std::nullopt;
-
-        std::vector<std::string> sharedStrings;
-        if (auto ss = archive.readEntry("xl/sharedStrings.xml")) {
-            sharedStrings = parseSharedStrings(*ss);
-        }
+        auto append = [](std::string& out, const std::string& text) {
+            if (text.empty()) return;
+            if (!out.empty()) out += '\n';
+            out += text;
+        };
 
         std::string out;
-        for (const auto& name : archive.entryNames()) {
-            if (name.rfind("xl/worksheets/sheet", 0) == 0 && name.size() > 4 &&
-                name.compare(name.size() - 4, 4, ".xml") == 0) {
-                if (auto sheet = archive.readEntry(name)) {
-                    out += extractSheetText(*sheet, sharedStrings);
+        if (docx) {
+            auto doc = archive.readEntry("word/document.xml");
+            if (!doc) return std::nullopt;
+            out = extractTextRuns(*doc, "w");
+            // Headers, footers, footnotes, endnotes and comments share the
+            // body's <w:t> markup; charts and SmartArt use DrawingML <a:t>.
+            for (const auto& name : parts) {
+                if (name == "word/document.xml") continue;
+                auto part = archive.readEntry(name);
+                if (!part) continue;
+                const bool drawingML = name.rfind("word/charts/", 0) == 0 || name.rfind("word/diagrams/", 0) == 0;
+                append(out, extractTextRuns(*part, drawingML ? "a" : "w"));
+            }
+        } else {
+            std::vector<std::string> sharedStrings;
+            if (auto ss = archive.readEntry("xl/sharedStrings.xml")) sharedStrings = parseSharedStrings(*ss);
+            if (auto workbook = archive.readEntry("xl/workbook.xml")) append(out, extractSheetNames(*workbook));
+            for (const auto& name : parts) {
+                if (name.rfind("xl/worksheets/", 0) == 0) {
+                    if (auto sheet = archive.readEntry(name)) out += extractSheetText(*sheet, sharedStrings);
                 }
+            }
+            for (const auto& name : parts) {
+                const bool drawingML = name.rfind("xl/drawings/", 0) == 0 || name.rfind("xl/charts/", 0) == 0 ||
+                                       name.rfind("xl/diagrams/", 0) == 0;
+                if (!drawingML && name.rfind("xl/comments", 0) != 0) continue;
+                auto part = archive.readEntry(name);
+                if (!part) continue;
+                append(out, drawingML ? extractTextRuns(*part, "a") : extractTElements(*part));
             }
         }
         return out.empty() ? std::nullopt : std::optional<std::string>(std::move(out));
     }
+
+    if (fileSize > options.maxBytes) return std::nullopt;
 
     if (extensionLowercase == ".pdf") {
         auto raw = readWholeFile(path);

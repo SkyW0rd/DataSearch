@@ -14,7 +14,6 @@
 
 using datasearch::core::ExtractionOptions;
 using datasearch::core::FileRecord;
-using datasearch::core::IndexProgress;
 using datasearch::core::Indexer;
 using datasearch::core::IndexerOptions;
 using datasearch::core::IndexStorage;
@@ -84,6 +83,13 @@ IndexManager::IndexManager(IPlatformService* platform, QObject* parent)
 }
 
 IndexManager::~IndexManager() {
+    // Signal every scan to stop before any is joined (the joins happen as
+    // indexers_ is destroyed), so they wind down in parallel instead of one
+    // after another.
+    {
+        std::lock_guard<std::mutex> lock(mapsMutex_);
+        for (auto& [root, indexer] : indexers_) indexer->cancel();
+    }
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         stopping_ = true;
@@ -226,12 +232,8 @@ void IndexManager::loadKnownSources() {
             }
 
             const QString rootLabel = QString::fromStdString(entry.root);
-            indexerPtr->startReconcile(
-                {datasearch::core::pathFromUtf8(entry.root)},
-                [this, rootLabel](const IndexProgress& p) {
-                    emit progress(p.filesIndexed, QString::fromStdString(p.currentPath), rootLabel);
-                },
-                [this, rootLabel](bool cancelled) { emit finished(rootLabel, cancelled); });
+            indexerPtr->startReconcile({datasearch::core::pathFromUtf8(entry.root)}, nullptr,
+                                        [this, rootLabel](bool cancelled) { emit finished(rootLabel, cancelled); });
         } catch (const std::exception& e) {
             emit watcherActivity(QString::fromStdString(entry.root),
                                   tr("Не удалось открыть индекс: %1").arg(e.what()));
@@ -239,26 +241,53 @@ void IndexManager::loadKnownSources() {
     }
 }
 
-void IndexManager::indexRoots(const std::vector<std::string>& roots) {
+std::vector<std::string> IndexManager::indexRoots(const std::vector<std::string>& roots) {
+    std::vector<std::string> alreadyRunning;
     for (const auto& root : roots) {
-        IndexStorage& storage = ensureStorage(root);
-
-        auto indexer =
-            std::make_unique<Indexer>(storage, currentScanOptions(), ExtractionOptions{}, makeIndexerOptions());
-        Indexer* indexerPtr = indexer.get();
+        std::unique_ptr<Indexer> previous;
         {
             std::lock_guard<std::mutex> lock(mapsMutex_);
-            indexers_[root] = std::move(indexer);
+            const auto it = indexers_.find(root);
+            if (it != indexers_.end() && it->second->isRunning()) {
+                if (it->second->isPaused()) it->second->resume();
+                alreadyRunning.push_back(root);
+                continue;
+            }
+            if (it != indexers_.end()) {
+                previous = std::move(it->second);
+                indexers_.erase(it);
+            }
         }
+        // Finished, so its destructor's join() returns at once — and it runs
+        // outside mapsMutex_ regardless.
+        previous.reset();
 
-        const QString rootLabel = QString::fromStdString(root);
-        indexerPtr->start(
-            {datasearch::core::pathFromUtf8(root)},
-            [this, rootLabel](const IndexProgress& p) {
-                emit progress(p.filesIndexed, QString::fromStdString(p.currentPath), rootLabel);
-            },
-            [this, rootLabel](bool cancelled) { emit finished(rootLabel, cancelled); });
+        try {
+            IndexStorage& storage = ensureStorage(root);
+            auto indexer =
+                std::make_unique<Indexer>(storage, currentScanOptions(), ExtractionOptions{}, makeIndexerOptions());
+            Indexer* indexerPtr = indexer.get();
+            {
+                std::lock_guard<std::mutex> lock(mapsMutex_);
+                indexers_[root] = std::move(indexer);
+            }
+
+            const QString rootLabel = QString::fromStdString(root);
+            indexerPtr->start({datasearch::core::pathFromUtf8(root)}, nullptr,
+                              [this, rootLabel](bool cancelled) { emit finished(rootLabel, cancelled); });
+        } catch (const std::exception& e) {
+            emit watcherActivity(QString::fromStdString(root), tr("Не удалось открыть индекс: %1").arg(e.what()));
+        }
     }
+    return alreadyRunning;
+}
+
+std::vector<IndexManager::RootStatus> IndexManager::indexingStatus() const {
+    std::lock_guard<std::mutex> lock(mapsMutex_);
+    std::vector<RootStatus> result;
+    result.reserve(indexers_.size());
+    for (const auto& [root, indexer] : indexers_) result.push_back({root, indexer->status()});
+    return result;
 }
 
 std::vector<FileRecord> IndexManager::search(const SearchQuery& query, const std::vector<std::string>& roots) {

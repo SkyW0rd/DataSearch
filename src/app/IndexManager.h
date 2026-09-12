@@ -47,10 +47,21 @@ public:
     // comment). Call once, after construction.
     void loadKnownSources();
 
-    // Opens (or creates) the index for each root not already indexed and starts
-    // a background full scan for it. On success, registers the source for
-    // next-startup reopening and starts watching it live.
-    void indexRoots(const std::vector<std::string>& roots);
+    // Opens (or creates) the index for each root and starts a background full
+    // scan for it. On success, registers the source for next-startup
+    // reopening and starts watching it live. A root whose scan is still in
+    // progress is left alone (resumed if paused) rather than restarted —
+    // restarting would mean waiting on the GUI thread for the file in flight,
+    // freezing the window. Returns those roots.
+    std::vector<std::string> indexRoots(const std::vector<std::string>& roots);
+
+    struct RootStatus {
+        std::string root;
+        datasearch::core::IndexerStatus status;
+    };
+    // One entry per source that has had a scan or reconcile this session,
+    // including finished ones. Cheap; meant to be polled by a UI timer.
+    std::vector<RootStatus> indexingStatus() const;
 
     // Searches across the indexes for the given roots (only those that have
     // already been opened via indexRoots/loadKnownSources — others are
@@ -96,7 +107,6 @@ public:
     bool isAnyIndexingPaused() const;
 
 signals:
-    void progress(quint64 filesIndexed, QString currentPath, QString rootLabel);
     void finished(QString rootLabel, bool cancelled);
     void watcherActivity(QString rootLabel, QString description);
     // A source was temporarily unreachable during a scan/reconcile (ТЗ

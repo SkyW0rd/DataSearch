@@ -239,15 +239,21 @@ void runContentExtractorTests() {
                             {"word/header1.xml", wordPart("hdr", "Header text")},
                             {"word/footer2.xml", wordPart("ftr", "Footer text")},
                             {"word/footnotes.xml", wordPart("footnotes", "Footnote text")},
-                            {"word/comments.xml", wordPart("comments", "Comment text")}});
+                            {"word/comments.xml", wordPart("comments", "Comment text")},
+                            {"word/charts/chart1.xml", "<c:chartSpace><a:p><a:r><a:t>Chart title</a:t></a:r></a:p></c:chartSpace>"},
+                            {"word/diagrams/data1.xml", "<dgm:dataModel><a:p><a:r><a:t>SmartArt step</a:t></a:r></a:p></dgm:dataModel>"}});
 
-        auto extracted = ContentExtractor::extract(docxPath, ".docx");
+        ExtractionOptions smallFile;
+        smallFile.maxBytes = 1024;  // the file is ~3 MB, nearly all picture
+        auto extracted = ContentExtractor::extract(docxPath, ".docx", smallFile);
         DS_CHECK(extracted.has_value());
         DS_CHECK(contains(*extracted, "Body text"));
         DS_CHECK(contains(*extracted, "Header text"));
         DS_CHECK(contains(*extracted, "Footer text"));
         DS_CHECK(contains(*extracted, "Footnote text"));
         DS_CHECK(contains(*extracted, "Comment text"));
+        DS_CHECK(contains(*extracted, "Chart title"));
+        DS_CHECK(contains(*extracted, "SmartArt step"));
         DS_CHECK(!contains(*extracted, "\x7f\x7f"));
     }
 
@@ -275,6 +281,65 @@ void runContentExtractorTests() {
         DS_CHECK(contains(*extracted, "Apple"));
         DS_CHECK(contains(*extracted, "\xd0\x91\xd0\xb0\xd0\xbd\xd0\xb0\xd0\xbd"));  // Банан
         DS_CHECK(contains(*extracted, "Extra note"));
+    }
+
+    // --- XLSX: numbers, sheet names, cell notes, chart and shape text -------
+    // Everything that can hold text is read; the embedded picture is not, and
+    // its size must not count against the limit (see the DOCX case below).
+    {
+        const std::string sheet1 =
+            "<worksheet><sheetData><row r=\"1\">"
+            "<c r=\"A1\"><v>582030</v></c>"
+            "<c r=\"B1\" t=\"n\"><v>1250.75</v></c>"
+            "<c r=\"C1\" t=\"b\"><v>1</v></c>"
+            "<c r=\"D1\" t=\"e\"><v>#DIV/0!</v></c>"
+            "<c r=\"E1\"><f>A1*2</f><v>1164060</v></c>"
+            "</row></sheetData></worksheet>";
+        const std::string workbook =
+            "<workbook><sheets><sheet name=\"Budget 2026\" sheetId=\"1\" r:id=\"rId1\"/>"
+            "<sheet name=\"Q&amp;A\" sheetId=\"2\" r:id=\"rId2\"/></sheets></workbook>";
+        const std::string comments =
+            "<comments><authors><author>Ivanov</author></authors><commentList>"
+            "<comment ref=\"A1\" authorId=\"0\"><text><r><rPr><b/></rPr><t>Check the contract</t></r>"
+            "<r><t xml:space=\"preserve\"> before paying</t></r></text></comment>"
+            "</commentList></comments>";
+        const std::string chart =
+            "<c:chartSpace><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Revenue by month</a:t></a:r></a:p>"
+            "</c:rich></c:tx></c:title></c:chart></c:chartSpace>";
+        const std::string drawing =
+            "<xdr:wsDr><xdr:sp><xdr:txBody><a:p><a:r><a:t>Shape caption</a:t></a:r></a:p>"
+            "<a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>Cell in shape table</a:t></a:r></a:p></a:txBody>"
+            "</a:tc></a:tr></a:tbl></xdr:txBody></xdr:sp></xdr:wsDr>";
+        const auto xlsxPath = root / "rich.xlsx";
+        writeZip(xlsxPath, {{"xl/media/image1.png", std::string(2 * 1024 * 1024, '\x7f')},
+                            {"xl/workbook.xml", workbook},
+                            {"xl/worksheets/sheet1.xml", sheet1},
+                            {"xl/comments1.xml", comments},
+                            {"xl/charts/chart1.xml", chart},
+                            {"xl/drawings/drawing1.xml", drawing}});
+
+        ExtractionOptions smallFile;
+        smallFile.maxBytes = 1024;  // the file is ~2 MB, nearly all picture
+        auto extracted = ContentExtractor::extract(xlsxPath, ".xlsx", smallFile);
+        DS_CHECK(extracted.has_value());
+        DS_CHECK(contains(*extracted, "582030"));
+        DS_CHECK(contains(*extracted, "1250.75"));
+        DS_CHECK(contains(*extracted, "1164060"));
+        DS_CHECK(!contains(*extracted, "#DIV/0!"));
+        DS_CHECK(contains(*extracted, "Budget 2026"));
+        DS_CHECK(contains(*extracted, "Q&A"));
+        DS_CHECK(contains(*extracted, "Check the contract"));
+        DS_CHECK(contains(*extracted, "before paying"));
+        DS_CHECK(!contains(*extracted, "Ivanov"));
+        DS_CHECK(!contains(*extracted, "rPr"));
+        DS_CHECK(contains(*extracted, "Revenue by month"));
+        DS_CHECK(contains(*extracted, "Shape caption"));
+        DS_CHECK(contains(*extracted, "Cell in shape table"));
+        DS_CHECK(!contains(*extracted, "\x7f\x7f"));
+
+        ExtractionOptions tinyUnpacked;
+        tinyUnpacked.maxUnpackedBytes = 64;  // text parts exceed this
+        DS_CHECK(!ContentExtractor::extract(xlsxPath, ".xlsx", tinyUnpacked).has_value());
     }
 
     // --- PDF: uncompressed content streams, Tj + TJ with a word gap --------
