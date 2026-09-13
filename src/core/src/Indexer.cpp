@@ -67,6 +67,7 @@ void Indexer::launch(std::vector<std::filesystem::path> roots, ProgressCallback 
     filesVisited_.store(0);
     filesWritten_.store(0);
     filesFailed_.store(0);
+    unreadableDirs_.store(0);
     activeWorkers_.store(0);
     parkedWorkers_.store(0);
     heavyFound_.store(0);
@@ -181,6 +182,7 @@ IndexerStatus Indexer::status() const {
     s.filesVisited = filesVisited_.load();
     s.filesWritten = filesWritten_.load();
     s.filesFailed = filesFailed_.load();
+    s.unreadableDirs = unreadableDirs_.load();
     s.heavyFound = heavyFound_.load();
     s.heavyDone = heavyDone_.load();
     s.heavyBytesTotal = heavyBytesTotal_.load();
@@ -234,6 +236,31 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
     // function's own local bookkeeping set, which IndexStorage knows nothing
     // about.
 
+    // An index from before the exact-word index existed: fill it in from the
+    // text it already stores (no files are read). Resumable — an interrupted
+    // run carries on from where it stopped next time.
+    if (const std::uint64_t pending = storage_.exactBackfillRemaining(); pending > 0) {
+        phase_.store(IndexPhase::Upgrading);
+        filesTotal_.store(pending);
+        activeWorkers_.store(1);
+        try {
+            while (!cancelled_.load(std::memory_order_relaxed)) {
+                waitWhilePaused();
+                if (cancelled_.load(std::memory_order_relaxed)) break;
+                const std::uint64_t done = storage_.backfillExactIndex(200);
+                if (done == 0) break;
+                filesVisited_ += done;
+            }
+        } catch (const std::exception& e) {
+            // Not fatal: the scan still runs, exact search just stays partial.
+            if (indexerOptions_.onFileError) indexerOptions_.onFileError("", e.what());
+        }
+        activeWorkers_.store(0);
+        filesTotal_.store(0);
+        filesVisited_.store(0);
+        phase_.store(reconcileMode ? IndexPhase::Indexing : IndexPhase::Counting);
+    }
+
     // Reconciliation (ТЗ п.13.2): snapshot what's already indexed *before*
     // scanning, so unchanged files can be skipped without touching the DB,
     // and so anything indexed-but-missing-on-disk can be found afterwards.
@@ -278,6 +305,13 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
     std::atomic<bool> anyRootUnavailable{false};
     std::vector<FileRecord> deferred;
     std::mutex deferredMutex;
+    std::vector<std::string> unreadableDirs;
+    std::mutex unreadableMutex;
+    auto onUnreadableDirectory = [&](const std::filesystem::path& dir) {
+        std::lock_guard<std::mutex> lock(unreadableMutex);
+        unreadableDirs.push_back(pathToUtf8(dir));
+        ++unreadableDirs_;
+    };
 
     const std::size_t threadCount = std::max<std::size_t>(
         1, std::min(roots.empty() ? std::size_t{1} : roots.size(),
@@ -374,7 +408,7 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
                     }
                     processFile(record);
                 },
-                &cancelled_);
+                &cancelled_, onUnreadableDirectory);
         }
         --activeWorkers_;
     };
@@ -427,9 +461,18 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
         // root was unreachable this pass — we can't tell which existing
         // records belong to the unavailable root, so it's safer to remove
         // nothing than to wrongly wipe files that are simply offline.
+        // Files inside a folder that couldn't be read this pass weren't seen,
+        // but that says nothing about whether they still exist — keep them.
+        auto insideUnreadable = [&](const std::string& path) {
+            for (const auto& dir : unreadableDirs) {
+                if (path.compare(0, dir.size(), dir) != 0) continue;
+                if (path.size() == dir.size() || path[dir.size()] == '/' || path[dir.size()] == '\\') return true;
+            }
+            return false;
+        };
         for (const auto& [path, stat] : existingByPath) {
             (void)stat;
-            if (visitedPaths.find(path) == visitedPaths.end()) {
+            if (visitedPaths.find(path) == visitedPaths.end() && !insideUnreadable(path)) {
                 storage_.removeFile(path);
             }
         }

@@ -27,6 +27,7 @@ using CompletionCallback = std::function<void(bool cancelled)>;
 
 enum class IndexPhase {
     Idle,       // never started
+    Upgrading,  // filling the exact-word index of an older index from its stored text
     Counting,   // walking the roots to learn how many files there are
     Indexing,   // processing files
     Finishing,  // final commit; when reconciling, also dropping vanished files
@@ -44,6 +45,8 @@ struct IndexerStatus {
     bool cancelRequested = false;
     bool cancelled = false;  // the run Finished because of cancel()
 
+    // While Upgrading: files to fill in / filled in so far (filesTotal /
+    // filesVisited), before the scan proper starts from zero.
     // While Counting: files found so far. Afterwards: the total. When
     // reconciling there is no counting pass and this is the number of files
     // the index held before the pass — an estimate (`totalIsEstimate`).
@@ -52,6 +55,10 @@ struct IndexerStatus {
     std::uint64_t filesVisited = 0;  // written + unchanged + failed
     std::uint64_t filesWritten = 0;
     std::uint64_t filesFailed = 0;
+    // Folders that couldn't be read (no access, path too long, I/O error).
+    // Their contents are unknown this run; a reconcile pass leaves whatever
+    // was indexed inside them untouched rather than treating it as deleted.
+    std::uint64_t unreadableDirs = 0;
 
     // Heavy files (IndexerOptions::heavyFileThreshold) are set aside during
     // the main pass and processed one at a time at the end.
@@ -204,6 +211,7 @@ private:
     std::atomic<std::uint64_t> filesVisited_{0};
     std::atomic<std::uint64_t> filesWritten_{0};
     std::atomic<std::uint64_t> filesFailed_{0};
+    std::atomic<std::uint64_t> unreadableDirs_{0};
     std::atomic<std::size_t> activeWorkers_{0};
     std::atomic<std::size_t> parkedWorkers_{0};
     std::atomic<std::uint64_t> heavyFound_{0};

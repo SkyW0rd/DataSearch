@@ -83,6 +83,40 @@ void runIndexerReconcileTests() {
     indexer.startReconcile({root});
     indexer.join();
     DS_CHECK_EQ(storage.fileCount(), std::uint64_t{2});
+    DS_CHECK_EQ(indexer.status().filesWritten, std::uint64_t{0});
+
+#if !defined(_WIN32)
+    // A folder that can't be read mid-walk must neither cut the rest of the
+    // walk short (files after it went unseen) nor make a reconcile drop what
+    // was indexed inside it as "deleted". Both used to happen, and with
+    // intermittent errors every start removed and re-added tens of thousands
+    // of files.
+    {
+        const auto dir = root / "walk_case";
+        writeFileAt(dir / "a_first" / "1.txt", "one", t0);
+        writeFileAt(dir / "m_locked" / "2.txt", "two", t0);
+        writeFileAt(dir / "z_last" / "3.txt", "three", t0);
+
+        IndexStorage walkStorage(":memory:");
+        Indexer walkIndexer(walkStorage);
+        walkIndexer.start({dir});
+        walkIndexer.join();
+        DS_CHECK_EQ(walkStorage.fileCount(), std::uint64_t{3});
+
+        std::filesystem::permissions(dir / "m_locked", std::filesystem::perms::none);
+        std::error_code probe;
+        std::filesystem::directory_iterator(dir / "m_locked", probe);
+        if (probe) {  // not when running as root, where permissions don't bite
+            writeFileAt(dir / "z_last" / "4.txt", "four", t1);
+            walkIndexer.startReconcile({dir});
+            walkIndexer.join();
+            DS_CHECK_EQ(walkStorage.fileCount(), std::uint64_t{4});  // 2.txt kept, 4.txt found
+            DS_CHECK_EQ(walkIndexer.status().unreadableDirs, std::uint64_t{1});
+            DS_CHECK_EQ(walkIndexer.status().filesWritten, std::uint64_t{1});
+        }
+        std::filesystem::permissions(dir / "m_locked", std::filesystem::perms::owner_all);
+    }
+#endif
 }
 
 void runIndexerUnavailableRootTests() {
