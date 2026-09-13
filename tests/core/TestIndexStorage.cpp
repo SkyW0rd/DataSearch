@@ -225,3 +225,48 @@ void runIndexStorageQueryOperatorTests() {
         for (const auto& r : results) DS_CHECK(r.path != report.path);
     }
 }
+
+// A folder deleted, moved or renamed: everything inside it leaves the index,
+// nothing next to it does (a sibling that merely starts with the same name,
+// a file named like the folder).
+void runIndexStorageRemoveUnderTests() {
+    using namespace datasearch::core;
+    IndexStorage storage(":memory:");
+    auto add = [&](const std::string& path) {
+        FileRecord r;
+        r.path = path;
+        r.name = path.substr(path.find_last_of("/\\") + 1);
+        r.extension = ".txt";
+        r.size = 1;
+        r.modifiedTime = 1;
+        storage.upsertFile(r, "text");
+    };
+    for (const char* p : {"/d/A/x.txt", "/d/A/sub/y.txt", "/d/AB/z.txt", "/d/A.txt", "/d/A 2/q.txt",
+                          "D:\\\xd0\x90\xd1\x80\xd1\x85\xd0\xb8\xd0\xb2\\w.txt",
+                          "D:\\\xd0\x90\xd1\x80\xd1\x85\xd0\xb8\xd0\xb2\\2020\\v.txt",
+                          "D:\\\xd0\x90\xd1\x80\xd1\x85\xd0\xb8\xd0\xb2 \xd1\x81\xd1\x82\xd0\xb0\xd1\x80\xd1\x8b\xd0\xb9\\u.txt"}) {
+        add(p);
+    }
+    storage.recordProblem(*storage.fileRecord("/d/A/sub/y.txt"), ExtractionProblem::Damaged);
+    DS_CHECK_EQ(storage.fileCount(), std::uint64_t{8});
+
+    DS_CHECK_EQ(storage.removeUnder("/d/A"), std::uint64_t{2});
+    DS_CHECK(!storage.fileRecord("/d/A/x.txt"));
+    DS_CHECK(!storage.fileRecord("/d/A/sub/y.txt"));
+    DS_CHECK(storage.fileRecord("/d/AB/z.txt"));
+    DS_CHECK(storage.fileRecord("/d/A.txt"));
+    DS_CHECK(storage.fileRecord("/d/A 2/q.txt"));
+    DS_CHECK(storage.problemFiles().empty());  // its entry went with it
+
+    // Windows paths, Cyrillic, a trailing separator.
+    DS_CHECK_EQ(storage.removeUnder("D:\\\xd0\x90\xd1\x80\xd1\x85\xd0\xb8\xd0\xb2\\"), std::uint64_t{2});
+    DS_CHECK(storage.fileRecord("D:\\\xd0\x90\xd1\x80\xd1\x85\xd0\xb8\xd0\xb2 \xd1\x81\xd1\x82\xd0\xb0\xd1\x80\xd1\x8b\xd0\xb9\\u.txt"));
+    DS_CHECK_EQ(storage.fileCount(), std::uint64_t{4});
+    DS_CHECK_EQ(storage.removeUnder("/nothing/here"), std::uint64_t{0});
+
+    // Searches no longer find what was removed.
+    SearchQuery q;
+    q.namePattern = "text";
+    q.limit = 20;
+    DS_CHECK_EQ(storage.search(q).size(), std::size_t{4});
+}

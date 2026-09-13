@@ -22,8 +22,13 @@ struct VolumeInfo {
     std::uint64_t freeBytes = 0;
 };
 
+// One change under a watched folder. `path` may be a file or a folder —
+// Windows doesn't say which, and a removed path can't be asked any more —
+// so the receiver goes by what is (or no longer is) on disk. Overflow: the
+// OS dropped changes (too many at once); `path` is the watched root, and
+// everything under it has to be checked again.
 struct FileSystemChange {
-    enum class Kind { Created, Modified, Removed, RenamedTo };
+    enum class Kind { Created, Modified, Removed, RenamedTo, Overflow };
     std::filesystem::path path;
     Kind kind;
 };

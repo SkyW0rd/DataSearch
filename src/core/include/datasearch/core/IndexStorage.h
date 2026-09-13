@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -99,6 +100,11 @@ public:
     // nothing extractable — those stay searchable by name/metadata only.
     void upsertFile(const FileRecord& record, const std::string& content = {});
     void removeFile(const std::string& path);
+    // Removes every indexed file inside `folder` (at any depth; either
+    // separator) — a folder deleted, moved or renamed. Returns how many.
+    std::uint64_t removeUnder(const std::string& folder);
+    // What's stored for one file (no text), if it's indexed.
+    std::optional<FileRecord> fileRecord(const std::string& path) const;
 
     // Full dump of indexed paths + their stored metadata — used for the
     // startup metadata-reconciliation pass (ТЗ п.13.2), not for interactive search.

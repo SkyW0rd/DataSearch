@@ -50,6 +50,11 @@ public:
     static std::optional<FileRecord> statFile(const std::filesystem::path& path,
                                                const ScanOptions& options = {});
 
+    // Whether scan() of `root` would skip `path` because it or a folder on
+    // the way to it (below `root`) matches an exclude mask — for a single
+    // live change, which statFile() alone would check by file name only.
+    static bool isExcluded(const std::string& root, const std::string& path, const ScanOptions& options);
+
     // Whether `root` currently resolves to an accessible directory. Used
     // before scanning/reconciling a source so a temporarily unreachable
     // network drive (ТЗ п.11.4: "диск недоступен") doesn't get treated as

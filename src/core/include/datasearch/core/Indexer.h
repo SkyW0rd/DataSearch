@@ -296,6 +296,11 @@ private:
         ExtractionProblem problem = ExtractionProblem::None;
         std::string error;  // the exception's text, for ExtractionProblem::Failed
     };
+    // An error outside any one file (the index can't be read or saved — a
+    // full or failing disk) ends the run as if cancelled, reported through
+    // onFileError with an empty path, instead of escaping the thread and
+    // taking the whole app down.
+    void finishAfterError(const std::string& what, const CompletionCallback& onComplete);
     void runInternal(std::vector<std::filesystem::path> roots,
                       ProgressCallback onProgress,
                       CompletionCallback onComplete,

@@ -14,6 +14,7 @@
 
 using datasearch::core::ExtractionOptions;
 using datasearch::core::FileRecord;
+using datasearch::core::FileScanner;
 using datasearch::core::Indexer;
 using datasearch::core::IndexerOptions;
 using datasearch::core::IndexStorage;
@@ -25,6 +26,10 @@ using datasearch::platform::FileSystemChange;
 using datasearch::platform::IPlatformService;
 
 namespace {
+
+// A change "kind" of our own, next to FileSystemChange::Kind's: read this
+// file again even if it looks unchanged (the user asked to retry it).
+constexpr int kRetryKind = 100;
 
 std::string sanitizeForFilename(const std::string& root) {
     std::string out = root;
@@ -76,6 +81,8 @@ IndexManager::IndexManager(IPlatformService* platform, QObject* parent)
             // can't remember it for next time.
         }
         startWatch(root);
+        // Changes were dropped while this run was going: check again.
+        if (rescanAfterRun_.erase(root) != 0) requestRescan(root);
     });
     connect(this, &IndexManager::finished, this, &IndexManager::problemFilesChanged);
 
@@ -91,6 +98,7 @@ IndexManager::~IndexManager() {
         std::lock_guard<std::mutex> lock(mapsMutex_);
         for (auto& [root, indexer] : indexers_) indexer->cancel();
     }
+    watcherCancelled_.store(true);  // a folder being walked for a live change
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         stopping_ = true;
@@ -171,6 +179,7 @@ void IndexManager::searchThreadMain() {
         if (job) {
             std::vector<FileRecord> results;
             std::uint64_t total = 0;
+            QString error;
             {
                 std::vector<IndexStorage*> sources;
                 {
@@ -180,10 +189,19 @@ void IndexManager::searchThreadMain() {
                         if (it != storages_.end()) sources.push_back(it->second.get());
                     }
                 }
+                // An error here (the index unreadable, out of memory) must
+                // not escape this thread — that would close the whole app.
+                // The search comes back empty instead.
                 if (!sources.empty()) {
-                    SearchEngine engine(sources);
-                    results = engine.search(job->query);
-                    total = engine.countMatches(job->query);
+                    try {
+                        SearchEngine engine(sources);
+                        results = engine.search(job->query);
+                        total = engine.countMatches(job->query);
+                    } catch (const std::exception& e) {
+                        results.clear();
+                        total = 0;
+                        error = QString::fromUtf8(e.what());
+                    }
                 }
             }
             QMetaObject::invokeMethod(
@@ -192,11 +210,17 @@ void IndexManager::searchThreadMain() {
                     onDone(std::move(results), total);
                 },
                 Qt::QueuedConnection);
+            // After the (empty) results, so their "found 0" doesn't hide it.
+            if (!error.isEmpty()) emit watcherActivity(tr("Поиск"), tr("не удалось выполнить: %1").arg(error));
             continue;
         }
 
         std::string snippet;
-        if (IndexStorage* storage = storageForPath(row.second)) snippet = storage->snippet(row.second, snippetQuery);
+        try {
+            if (IndexStorage* storage = storageForPath(row.second)) snippet = storage->snippet(row.second, snippetQuery);
+        } catch (const std::exception&) {
+            // No excerpt for this row; the row itself is still shown.
+        }
         QMetaObject::invokeMethod(
             snippetContext,
             [onEach = std::move(onEach), row = std::move(row), snippet = std::move(snippet)]() mutable {
@@ -268,9 +292,14 @@ IndexerOptions IndexManager::makeIndexerOptions(const std::string& root) {
     options.onRootUnavailable = [this](const std::filesystem::path& root) {
         emit sourceUnavailable(QString::fromStdString(datasearch::core::pathToUtf8(root)));
     };
-    options.onFileError = [this](const std::string& path, const std::string& what) {
-        emit watcherActivity(QString::fromStdString(path),
-                              tr("Файл пропущен из-за ошибки: %1").arg(QString::fromStdString(what)));
+    // Writing to the index failed — for one file, or (empty path) for the
+    // whole run, which then stopped. Files whose text couldn't be read
+    // aren't reported here; they go to the list of such files.
+    options.onFileError = [this, root](const std::string& path, const std::string& what) {
+        emit watcherActivity(QString::fromStdString(path.empty() ? root : path),
+                              path.empty() ? tr("индексация остановлена из-за ошибки записи в индекс: %1")
+                                                 .arg(QString::fromStdString(what))
+                                           : tr("не удалось записать в индекс: %1").arg(QString::fromStdString(what)));
     };
     return options;
 }
@@ -341,23 +370,48 @@ bool IndexManager::isAnyIndexingPaused() const {
 void IndexManager::loadKnownSources() {
     for (const auto& entry : registry_->all()) {
         try {
-            IndexStorage& storage = ensureStorage(entry.root);
-
-            auto indexer =
-                std::make_unique<Indexer>(storage, currentScanOptions(), ExtractionOptions{}, makeIndexerOptions(entry.root));
-            Indexer* indexerPtr = indexer.get();
-            {
-                std::lock_guard<std::mutex> lock(mapsMutex_);
-                indexers_[entry.root] = std::move(indexer);
-            }
-
-            const QString rootLabel = QString::fromStdString(entry.root);
-            indexerPtr->startReconcile({datasearch::core::pathFromUtf8(entry.root)}, nullptr,
-                                        [this, rootLabel](bool cancelled) { emit finished(rootLabel, cancelled); });
+            startReconcile(entry.root);
         } catch (const std::exception& e) {
             emit watcherActivity(QString::fromStdString(entry.root),
                                   tr("Не удалось открыть индекс: %1").arg(e.what()));
         }
+    }
+}
+
+void IndexManager::startReconcile(const std::string& root) {
+    IndexStorage& storage = ensureStorage(root);
+    auto indexer = std::make_unique<Indexer>(storage, currentScanOptions(), ExtractionOptions{}, makeIndexerOptions(root));
+    Indexer* indexerPtr = indexer.get();
+    std::unique_ptr<Indexer> previous;
+    {
+        std::lock_guard<std::mutex> lock(mapsMutex_);
+        auto& slot = indexers_[root];
+        previous = std::move(slot);
+        slot = std::move(indexer);
+    }
+    previous.reset();  // a finished run: its join() returns at once
+
+    const QString rootLabel = QString::fromStdString(root);
+    indexerPtr->startReconcile({datasearch::core::pathFromUtf8(root)}, nullptr,
+                               [this, rootLabel](bool cancelled) { emit finished(rootLabel, cancelled); });
+}
+
+void IndexManager::requestRescan(const std::string& root) {
+    {
+        std::lock_guard<std::mutex> lock(mapsMutex_);
+        if (storages_.find(root) == storages_.end()) return;
+        const auto it = indexers_.find(root);
+        if (it != indexers_.end() && it->second->isRunning()) {
+            rescanAfterRun_.insert(root);  // after this run, which may be past the changes already
+            return;
+        }
+    }
+    try {
+        startReconcile(root);
+        emit watcherActivity(QString::fromStdString(root),
+                              tr("изменений сразу слишком много — проверяем все файлы в фоне"));
+    } catch (const std::exception& e) {
+        emit watcherActivity(QString::fromStdString(root), tr("Не удалось проверить изменения: %1").arg(e.what()));
     }
 }
 
@@ -434,6 +488,10 @@ void IndexManager::startWatch(const std::string& root) {
 }
 
 void IndexManager::onRawFileSystemChange(QString root, QString path, int kind) {
+    if (kind == static_cast<int>(FileSystemChange::Kind::Overflow)) {
+        requestRescan(root.toStdString());
+        return;
+    }
     stagedByRoot_[root.toStdString()][path.toStdString()] = kind;
     debounceTimer_.start();  // (re)start the coalescing window
 }
@@ -484,27 +542,64 @@ void IndexManager::watcherThreadMain() {
     }
 }
 
+// Goes by what's on disk now rather than by the event's kind alone: Windows
+// doesn't say whether a path is a file or a folder, and events for one path
+// are coalesced (see onRawFileSystemChange), so the last kind may be stale.
 void IndexManager::applyChange(IndexStorage& storage, const std::string& root, const std::string& pathUtf8,
                                 int kindInt) {
-    (void)root;
     using Kind = FileSystemChange::Kind;
-    const auto kind = static_cast<Kind>(kindInt);
+    const ScanOptions options = currentScanOptions();
 
-    if (kind == Kind::Removed) {
-        storage.removeFile(pathUtf8);
-        return;
-    }
-
+    // Inside an excluded folder (ТЗ FR-8), or gone: nothing of it belongs in
+    // the index — if it was a folder, none of what was in it either.
     const auto fsPath = datasearch::core::pathFromUtf8(pathUtf8);
-    const auto stat = datasearch::core::FileScanner::statFile(fsPath, currentScanOptions());
-    if (!stat) {
-        // Gone again, is a directory, or matches an exclude mask (ТЗ FR-8) —
-        // either way it shouldn't be in the index.
+    std::error_code ec;
+    const auto type = std::filesystem::symlink_status(fsPath, ec).type();
+    if (FileScanner::isExcluded(root, pathUtf8, options) || ec || type == std::filesystem::file_type::not_found) {
         storage.removeFile(pathUtf8);
+        storage.removeUnder(pathUtf8);
         return;
     }
 
-    FileRecord record = *stat;
+    if (type == std::filesystem::file_type::directory) {
+        // A folder new here — created, or moved or renamed in, which
+        // reports nothing for the files it brings — is walked for them.
+        // One merely modified (a file in it changed) has that file's own event.
+        if (kindInt == static_cast<int>(Kind::Created) || kindInt == static_cast<int>(Kind::RenamedTo)) {
+            storage.beginBatch();
+            struct Commit {
+                IndexStorage& storage;
+                ~Commit() {
+                    try {
+                        storage.commitBatch();
+                    } catch (...) {
+                    }
+                }
+            } commit{storage};
+            FileScanner::scan(fsPath, options, [&](const FileRecord& record) { indexFile(storage, record, false); },
+                              &watcherCancelled_);
+        }
+        return;
+    }
+
+    const auto stat = FileScanner::statFile(fsPath, options);
+    if (!stat) {
+        // Not a regular file (a link) or its name is excluded.
+        storage.removeFile(pathUtf8);
+        return;
+    }
+    indexFile(storage, *stat, kindInt == kRetryKind);
+}
+
+void IndexManager::indexFile(IndexStorage& storage, const FileRecord& record, bool force) {
+    // Already indexed as it is — a folder copied in reports each of its
+    // files as well as itself, so most arrive twice.
+    if (!force) {
+        const auto stored = storage.fileRecord(record.path);
+        if (stored && stored->size == record.size && stored->modifiedTime == record.modifiedTime) return;
+    }
+
+    const auto fsPath = datasearch::core::pathFromUtf8(record.path);
     std::string content;
     std::string ext = record.extension;
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -548,7 +643,7 @@ void IndexManager::retryProblemFiles(const std::vector<std::pair<std::string, st
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         for (const auto& [root, path] : rootsAndPaths) {
-            pendingByRoot_[root][path] = static_cast<int>(FileSystemChange::Kind::Modified);
+            pendingByRoot_[root][path] = kRetryKind;
         }
     }
     pendingCv_.notify_one();

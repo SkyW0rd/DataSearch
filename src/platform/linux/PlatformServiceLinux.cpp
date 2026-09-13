@@ -162,6 +162,11 @@ private:
     }
 
     void handleEvent(const struct inotify_event* event) {
+        // The kernel's queue overflowed: changes were dropped.
+        if (event->mask & IN_Q_OVERFLOW) {
+            if (onChange_) onChange_(FileSystemChange{root_, FileSystemChange::Kind::Overflow});
+            return;
+        }
         if (event->mask & IN_IGNORED) {
             std::lock_guard<std::mutex> lock(watchesMutex_);
             watchToPath_.erase(event->wd);
@@ -180,10 +185,11 @@ private:
         const std::filesystem::path itemPath = dirPath / std::string(event->name);
 
         if (event->mask & IN_ISDIR) {
-            // inotify isn't recursive: pick up newly created subdirectories
-            // so files created inside them are seen too.
-            if (event->mask & IN_CREATE) addWatchesRecursive(itemPath);
-            return;
+            // inotify isn't recursive: pick up new subdirectories (created
+            // or moved in) so files created inside them are seen too. The
+            // folder itself is reported as well — its files come or go with it.
+            if (event->mask & (IN_CREATE | IN_MOVED_TO)) addWatchesRecursive(itemPath);
+            if (!(event->mask & (IN_CREATE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM))) return;
         }
 
         FileSystemChange change;

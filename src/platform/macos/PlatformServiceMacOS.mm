@@ -104,7 +104,15 @@ private:
         auto** eventPaths = static_cast<char**>(eventPathsRaw);
 
         for (std::size_t i = 0; i < numEvents; ++i) {
-            if (!(eventFlags[i] & kFSEventStreamEventFlagItemIsFile)) continue;
+            // Events were dropped (or coalesced into "look at this folder"):
+            // the tree has to be checked again.
+            if (eventFlags[i] & (kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped |
+                                 kFSEventStreamEventFlagKernelDropped)) {
+                if (self->onChange_) self->onChange_(FileSystemChange{self->root_, FileSystemChange::Kind::Overflow});
+                continue;
+            }
+            // Folders too: one moved, renamed or deleted takes its files with it.
+            if (!(eventFlags[i] & (kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsDir))) continue;
 
             FileSystemChange change;
             change.path = pathFromUtf8(eventPaths[i]);

@@ -12,7 +12,9 @@
 #include <functional>
 #include <optional>
 
+#include <atomic>
 #include <condition_variable>
+#include <set>
 #include <deque>
 #include <filesystem>
 #include <map>
@@ -163,6 +165,14 @@ private:
     // Opens/creates storage+indexer for `root` if not already present.
     datasearch::core::IndexStorage& ensureStorage(const std::string& root);
     void startWatch(const std::string& root);
+    // A background check of what changed under `root` (GUI thread).
+    void startReconcile(const std::string& root);
+    // The OS dropped changes under `root`: check it all again — now, or
+    // after the run in progress, which may be past them already.
+    void requestRescan(const std::string& root);
+    // Indexes one file for a live change, unless it's already indexed as it
+    // is (`force`: read it again anyway).
+    void indexFile(datasearch::core::IndexStorage& storage, const datasearch::core::FileRecord& record, bool force);
     void watcherThreadMain();
     void applyChange(datasearch::core::IndexStorage& storage, const std::string& root,
                       const std::string& pathUtf8, int kindInt);
@@ -183,6 +193,9 @@ private:
     std::map<std::string, std::unique_ptr<datasearch::core::IndexStorage>> storages_;
     std::map<std::string, std::unique_ptr<datasearch::core::Indexer>> indexers_;
     std::map<std::string, std::unique_ptr<datasearch::platform::IDirectoryWatch>> watches_;
+
+    std::set<std::string> rescanAfterRun_;  // GUI thread only
+    std::atomic<bool> watcherCancelled_{false};
 
     // GUI-thread-only staging area, drained into pendingByRoot_ on debounce timeout.
     std::map<std::string, std::map<std::string, int>> stagedByRoot_;

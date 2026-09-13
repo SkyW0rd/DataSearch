@@ -21,6 +21,8 @@ void runExactBackfillTests();
 void runNaturalOrderTests();
 void runSearchFilterTests();
 void runProblemFilesTests();
+void runIndexerLockedIndexTests();
+void runIndexStorageRemoveUnderTests();
 
 namespace {
 
@@ -51,6 +53,8 @@ int main() {
         {"NaturalOrder", runNaturalOrderTests},
         {"SearchFilters", runSearchFilterTests},
         {"ProblemFiles", runProblemFilesTests},
+        {"IndexerLockedIndex", runIndexerLockedIndexTests},
+        {"IndexStorageRemoveUnder", runIndexStorageRemoveUnderTests},
     };
 
     int failures = 0;

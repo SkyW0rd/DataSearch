@@ -114,6 +114,36 @@ void runFileScannerTests() {
     DS_CHECK(!FileScanner::statFile(root / "does_not_exist.txt", options).has_value());
     DS_CHECK(!FileScanner::statFile(root / "skip.tmp", options).has_value());  // excluded by mask
 
+    // isExcluded: a live change deep inside an excluded folder is skipped,
+    // as the full walk would skip it; only folders below the root count.
+    {
+        ScanOptions masks;
+        masks.excludeMasks = {"node_modules", ".git", "*.tmp"};
+        DS_CHECK(FileScanner::isExcluded("/r", "/r/app/node_modules/lib/x.js", masks));
+        DS_CHECK(FileScanner::isExcluded("/r", "/r/app/cache.TMP", masks));
+        DS_CHECK(!FileScanner::isExcluded("/r", "/r/app/readme.txt", masks));
+        DS_CHECK(!FileScanner::isExcluded("/r", "/r/.gitignore", masks));
+        DS_CHECK(FileScanner::isExcluded("D:\\", "D:\\work\\.git\\HEAD", masks));
+        DS_CHECK(!FileScanner::isExcluded("/r/node_modules/proj", "/r/node_modules/proj/a.txt", masks));
+        DS_CHECK(!FileScanner::isExcluded("/r", "/r/app/node_modules/x.js", ScanOptions{}));
+        // An Office owner file ("~$" + the open document's name) never counts.
+        DS_CHECK(FileScanner::isExcluded("/r", "/r/app/~$report.docx", ScanOptions{}));
+        DS_CHECK(!FileScanner::isExcluded("/r", "/r/app/~report.docx", ScanOptions{}));
+    }
+    {
+        writeFile(root / "office" / "report.docx", "doc");
+        writeFile(root / "office" / "~$report.docx", "lock");
+        std::size_t seen = 0;
+        bool ownerSeen = false;
+        FileScanner::scan(root / "office", {}, [&](const FileRecord& r) {
+            ++seen;
+            ownerSeen = ownerSeen || r.name.rfind("~$", 0) == 0;
+        });
+        DS_CHECK_EQ(seen, std::size_t{1});
+        DS_CHECK(!ownerSeen);
+        DS_CHECK(!FileScanner::statFile(root / "office" / "~$report.docx", {}).has_value());
+    }
+
     // isAccessible: used to detect a temporarily unreachable source
     // (ТЗ п.11.4) before treating "nothing found" as "everything deleted".
     DS_CHECK(FileScanner::isAccessible(root));

@@ -2,11 +2,16 @@
 
 #include "datasearch/core/Indexer.h"
 #include "datasearch/core/IndexStorage.h"
+#include "datasearch/core/Utf8.h"
+
+#include <sqlite3.h>
 
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <thread>
+#include <vector>
 
 using namespace datasearch::core;
 
@@ -231,4 +236,69 @@ void runProblemFilesTests() {
     indexer.join();
     DS_CHECK_EQ(indexer.status().filesRemoved, std::uint64_t{1});
     DS_CHECK(storage.problemFiles().empty());
+}
+
+// The index held by another connection (a second copy of the app, say): a
+// short hold is waited out; a long one ends the run cleanly — reported,
+// finished as stopped — instead of an exception killing the process.
+void runIndexerLockedIndexTests() {
+    const auto root = makeScratchDir();
+    struct Cleanup {
+        std::filesystem::path p;
+        ~Cleanup() { std::filesystem::remove_all(p); }
+    } cleanup{root};
+    const auto t0 = std::filesystem::file_time_type::clock::now() - std::chrono::hours(1);
+    for (const char* name : {"a.txt", "b.txt", "c.txt"}) writeFileAt(root / "docs" / name, "some words", t0);
+    const auto dbPath = root / "index.sqlite3";
+
+    IndexStorage storage(dbPath);
+    std::vector<std::string> errors;
+    IndexerOptions options;
+    options.onFileError = [&](const std::string& path, const std::string&) { errors.push_back(path); };
+    Indexer indexer(storage, ScanOptions{}, ExtractionOptions{}, options);
+
+    auto holdFor = [&](std::chrono::milliseconds hold) {
+        sqlite3* other = nullptr;
+        sqlite3_open(pathToUtf8(dbPath).c_str(), &other);
+        sqlite3_exec(other, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
+        return std::thread([other, hold] {
+            std::this_thread::sleep_for(hold);
+            sqlite3_exec(other, "COMMIT;", nullptr, nullptr, nullptr);
+            sqlite3_close(other);
+        });
+    };
+
+    {
+        auto holder = holdFor(std::chrono::milliseconds(500));
+        bool cancelled = true;
+        indexer.start({root / "docs"}, nullptr, [&](bool c) { cancelled = c; });
+        indexer.join();
+        holder.join();
+        DS_CHECK(!cancelled);
+        DS_CHECK_EQ(storage.fileCount(), std::uint64_t{3});
+        DS_CHECK(errors.empty());
+    }
+    {
+        writeFileAt(root / "docs" / "d.txt", "more words", t0);
+        auto holder = holdFor(std::chrono::milliseconds(4500));
+        bool completed = false, cancelled = false;
+        indexer.startReconcile({root / "docs"}, nullptr, [&](bool c) {
+            completed = true;
+            cancelled = c;
+        });
+        indexer.join();
+        holder.join();
+        DS_CHECK(completed);
+        DS_CHECK(cancelled);
+        DS_CHECK(indexer.status().phase == IndexPhase::Finished);
+        DS_CHECK(!errors.empty() && errors.back().empty());  // reported as a whole-run error
+    }
+    // Once free again, the next run goes through.
+    indexer.startReconcile({root / "docs"});
+    indexer.join();
+    DS_CHECK_EQ(storage.fileCount(), std::uint64_t{4});
+    SearchQuery q;
+    q.namePattern = "words";
+    q.limit = 10;
+    DS_CHECK_EQ(storage.search(q).size(), std::size_t{4});
 }

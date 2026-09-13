@@ -40,7 +40,13 @@ bool matchesGlob(const std::string& pattern, const std::string& text) {
     return dp[p.size()][t.size()] != 0;
 }
 
+// Word/Excel/PowerPoint's "~$name.docx" owner file, there only while the
+// document is open: a few bytes of lock data, never worth indexing (it would
+// be listed as a damaged document and turn up when searching the name).
+bool isOfficeOwnerFile(const std::string& name) { return name.size() > 2 && name[0] == '~' && name[1] == '$'; }
+
 bool matchesAnyMask(const std::vector<std::string>& masks, const std::string& name) {
+    if (isOfficeOwnerFile(name)) return true;
     for (const auto& mask : masks) {
         if (matchesGlob(mask, name)) return true;
     }
@@ -200,6 +206,18 @@ std::optional<FileRecord> FileScanner::statFile(const std::filesystem::path& pat
     }
 
     return record;
+}
+
+bool FileScanner::isExcluded(const std::string& root, const std::string& path, const ScanOptions& options) {
+    std::size_t pos = path.compare(0, root.size(), root) == 0 ? root.size() : 0;
+    while (pos < path.size()) {
+        while (pos < path.size() && (path[pos] == '/' || path[pos] == '\\')) ++pos;
+        std::size_t end = pos;
+        while (end < path.size() && path[end] != '/' && path[end] != '\\') ++end;
+        if (end > pos && matchesAnyMask(options.excludeMasks, path.substr(pos, end - pos))) return true;
+        pos = end;
+    }
+    return false;
 }
 
 bool FileScanner::isAccessible(const std::filesystem::path& root) {

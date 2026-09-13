@@ -119,8 +119,33 @@ void Indexer::launch(std::vector<std::filesystem::path> roots, ProgressCallback 
     // reports a live run rather than Idle/Finished.
     phase_.store(reconcileMode ? IndexPhase::Indexing : IndexPhase::Counting);
     running_.store(true);
-    worker_ = std::thread(&Indexer::runInternal, this, std::move(roots), std::move(onProgress),
-                           std::move(onComplete), reconcileMode);
+    worker_ = std::thread([this, roots = std::move(roots), onProgress = std::move(onProgress),
+                           onComplete = std::move(onComplete), reconcileMode]() mutable {
+        try {
+            runInternal(std::move(roots), std::move(onProgress), onComplete, reconcileMode);
+        } catch (const std::exception& e) {
+            finishAfterError(e.what(), onComplete);
+        } catch (...) {
+            finishAfterError("unknown error", onComplete);
+        }
+    });
+}
+
+void Indexer::finishAfterError(const std::string& what, const CompletionCallback& onComplete) {
+    if (indexerOptions_.onFileError) indexerOptions_.onFileError({}, what);
+    try {
+        storage_.commitBatch();  // keep what was written, if the disk lets us
+    } catch (...) {
+    }
+    finishedCancelled_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(statusMutex_);
+        currentInProgress_ = false;
+        finishedAt_ = std::chrono::steady_clock::now();
+    }
+    phase_.store(IndexPhase::Finished);
+    running_.store(false, std::memory_order_relaxed);
+    if (onComplete) onComplete(true);
 }
 
 // The flags are changed under pauseMutex_ (not just stored atomically) so a
@@ -691,9 +716,13 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
             (void)stat;
             if (visitedPaths.find(path) == visitedPaths.end() && !insideUnreadable(path)) {
                 const auto removeStarted = Clock::now();
-                storage_.removeFile(path);
+                try {
+                    storage_.removeFile(path);
+                    ++filesRemoved_;
+                } catch (const std::exception& e) {
+                    if (indexerOptions_.onFileError) indexerOptions_.onFileError(path, e.what());
+                }
                 writingNs_ += nanosSince(removeStarted);
-                ++filesRemoved_;
             }
         }
     }

@@ -104,11 +104,15 @@ private:
                 return;  // stop requested
             }
 
+            // Zero bytes (or ERROR_NOTIFY_ENUM_DIR) means the buffer overflowed:
+            // changes were dropped, and the whole tree must be checked again.
             DWORD transferred = 0;
-            if (!::GetOverlappedResult(dirHandle_, &overlapped_, &transferred, FALSE) ||
-                transferred == 0) {
+            const BOOL done = ::GetOverlappedResult(dirHandle_, &overlapped_, &transferred, FALSE);
+            if ((done && transferred == 0) || (!done && ::GetLastError() == ERROR_NOTIFY_ENUM_DIR)) {
+                if (onChange_) onChange_(FileSystemChange{root_, FileSystemChange::Kind::Overflow});
                 continue;
             }
+            if (!done) continue;
 
             std::size_t offset = 0;
             while (offset < transferred) {

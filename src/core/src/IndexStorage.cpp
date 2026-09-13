@@ -308,6 +308,9 @@ IndexStorage::IndexStorage(const std::filesystem::path& dbPath) {
 
     // WAL + NORMAL sync: readers never block on a writer, and a crash mid-write
     // can't corrupt the database (ТЗ NFR-5) — the last committed transaction stands.
+    // Another connection holding the database for a moment (a checkpoint, a
+    // second copy of the app) is waited out rather than failing at once.
+    sqlite3_busy_timeout(db_, 3000);
     execOrThrow(db_, "PRAGMA journal_mode=WAL;");
     // The WAL file otherwise keeps the size of the largest transaction it has
     // held (a batch with a huge document: hundreds of MB) for as long as the
@@ -345,6 +348,7 @@ IndexStorage::IndexStorage(const std::filesystem::path& dbPath) {
         if (sqlite3_open(pathText.c_str(), &reader) == SQLITE_OK && registerRussianFts5Tokenizer(reader) &&
             registerPathCollations(reader)) {
             execOrThrow(reader, "PRAGMA query_only=1;");
+            sqlite3_busy_timeout(reader, 3000);
             readDb_ = reader;
         } else if (reader != nullptr) {
             sqlite3_close(reader);  // searches share the writer connection then
@@ -570,6 +574,37 @@ void IndexStorage::removeFile(const std::string& path) {
     }
 
     if (ownTransaction) commitBatch();
+}
+
+std::uint64_t IndexStorage::removeUnder(const std::string& folder) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::string base = folder;
+    while (base.size() > 1 && (base.back() == '/' || base.back() == '\\')) base.pop_back();
+    // "base/" <= path < "base0" ('0' follows '/'), and the same for '\' —
+    // a range on the path index, not a scan of the whole table.
+    std::vector<std::string> paths;
+    for (const char separator : {'/', '\\'}) {
+        const std::string low = base + separator;
+        const std::string high = base + static_cast<char>(separator + 1);
+        Statement sel(db_, "SELECT path FROM files WHERE path >= ?1 AND path < ?2;");
+        sqlite3_bind_text(sel, 1, low.c_str(), static_cast<int>(low.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(sel, 2, high.c_str(), static_cast<int>(high.size()), SQLITE_TRANSIENT);
+        while (sqlite3_step(sel) == SQLITE_ROW) paths.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(sel, 0)));
+    }
+    if (paths.empty()) return 0;
+    const bool ownTransaction = !inBatch_;
+    if (ownTransaction) beginBatch();
+    for (const auto& path : paths) removeFile(path);
+    if (ownTransaction) commitBatch();
+    return paths.size();
+}
+
+std::optional<FileRecord> IndexStorage::fileRecord(const std::string& path) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT path, name, ext, size, created_time, modified_time FROM files WHERE path = ?1;");
+    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_ROW) return std::nullopt;
+    return readRow(stmt, /*hasSnippet=*/false);
 }
 
 std::vector<FileRecord> IndexStorage::allRecords() const {
