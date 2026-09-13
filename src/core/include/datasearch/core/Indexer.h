@@ -54,6 +54,8 @@ struct IndexerStatus {
     bool totalIsEstimate = false;
     std::uint64_t filesVisited = 0;  // written + unchanged + failed
     std::uint64_t filesWritten = 0;
+    // Reconcile only: indexed files no longer on disk, dropped from the index.
+    std::uint64_t filesRemoved = 0;
     std::uint64_t filesFailed = 0;
     // Folders that couldn't be read (no access, path too long, I/O error).
     // Their contents are unknown this run; a reconcile pass leaves whatever
@@ -237,6 +239,7 @@ private:
     std::atomic<std::uint64_t> filesTotal_{0};
     std::atomic<std::uint64_t> filesVisited_{0};
     std::atomic<std::uint64_t> filesWritten_{0};
+    std::atomic<std::uint64_t> filesRemoved_{0};
     std::atomic<std::uint64_t> filesFailed_{0};
     std::atomic<std::uint64_t> unreadableDirs_{0};
     std::atomic<std::size_t> extractionThreads_{0};

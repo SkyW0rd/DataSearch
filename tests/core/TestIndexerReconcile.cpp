@@ -60,6 +60,8 @@ void runIndexerReconcileTests() {
     indexer.join();
 
     DS_CHECK_EQ(storage.fileCount(), std::uint64_t{2});
+    DS_CHECK_EQ(indexer.status().filesWritten, std::uint64_t{2});  // a.txt changed, c.txt new
+    DS_CHECK_EQ(indexer.status().filesRemoved, std::uint64_t{1});  // b.txt gone
 
     auto all = storage.allRecords();
     bool hasA = false, hasB = false, hasC = false;
@@ -84,6 +86,7 @@ void runIndexerReconcileTests() {
     indexer.join();
     DS_CHECK_EQ(storage.fileCount(), std::uint64_t{2});
     DS_CHECK_EQ(indexer.status().filesWritten, std::uint64_t{0});
+    DS_CHECK_EQ(indexer.status().filesRemoved, std::uint64_t{0});
 
 #if !defined(_WIN32)
     // A folder that can't be read mid-walk must neither cut the rest of the

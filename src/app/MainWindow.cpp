@@ -12,6 +12,7 @@
 #include <chrono>
 #include <iterator>
 #include <set>
+#include <utility>
 
 #include <QAbstractItemView>
 #include <QAction>
@@ -339,8 +340,10 @@ QString describeIndexing(const QString& root, const IndexerStatus& s, double fil
                 return QObject::tr("%1: остановлено — обработано %2 из %3").arg(name, formatCount(s.filesVisited), total);
             }
             if (s.reconcile) {
-                return QObject::tr("%1: изменения проверены за %2, обновлено %3%4")
-                    .arg(name, formatDuration(took), formatCount(s.filesWritten), failed);
+                const QString removed =
+                    s.filesRemoved > 0 ? QObject::tr(", удалено %1").arg(formatCount(s.filesRemoved)) : QString();
+                return QObject::tr("%1: изменения проверены за %2, обновлено %3%4%5")
+                    .arg(name, formatDuration(took), formatCount(s.filesWritten), removed, failed);
             }
             const QString heavy =
                 s.heavyDone > 0 ? QObject::tr(", из них крупных: %1").arg(formatCount(s.heavyDone)) : QString();
@@ -557,13 +560,13 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     }
     onExcludeMasksEdited();
 
+    // Reopen sources from a previous session instantly, then reconcile them
+    // in the background (ТЗ п.13.1/FR-23) — search works right away below.
+    // Before the source list is built, so those sources show up ticked.
+    indexManager_->loadKnownSources();
     populateVolumes();
     // Ticking a source on or off searches the new set of sources.
     connect(volumeList_, &QListWidget::itemChanged, &searchDebounce_, qOverload<>(&QTimer::start));
-
-    // Reopen sources from a previous session instantly, then reconcile them
-    // in the background (ТЗ п.13.1/FR-23) — search works right away below.
-    indexManager_->loadKnownSources();
     runSearch();
 }
 
@@ -690,10 +693,11 @@ void MainWindow::runSearch() {
     const QString requestText = searchEdit_->text();
     const bool requestExact = query.exactWords;
     const QString filters = activeFiltersText();
+    const ScrollAnchor anchor = std::exchange(scrollAnchor_, {});
     indexManager_->searchAsync(
         query, stdRoots, this,
-        [this, request, requestText, requestExact, filters](std::vector<datasearch::core::FileRecord> results,
-                                                            std::uint64_t total) {
+        [this, request, requestText, requestExact, filters, anchor](std::vector<datasearch::core::FileRecord> results,
+                                                                    std::uint64_t total) {
             // The user may have kept typing (or changed the selected
             // sources, the mode, the order or a filter) while this search was
             // running — a newer runSearch() call already queued a fresher
@@ -717,6 +721,7 @@ void MainWindow::runSearch() {
             snippetRequested_.assign(results.size(), false);
             resultsModel_->setRecords(std::move(results));
             fitPathColumn();
+            restoreScrollAnchor(anchor);
             requestVisibleSnippets();
         });
 }
@@ -771,9 +776,40 @@ void MainWindow::onIndexSelectedClicked() {
     updateIndexingStatus();
 }
 
-void MainWindow::onIndexFinished(const QString&, bool) {
+void MainWindow::onIndexFinished(const QString& rootLabel, bool) {
     updateIndexingStatus();
+    // A startup check that found nothing new leaves the results alone.
+    for (const auto& entry : indexManager_->indexingStatus()) {
+        const IndexerStatus& s = entry.status;
+        if (QString::fromStdString(entry.root) == rootLabel && s.reconcile && s.filesWritten == 0 &&
+            s.filesRemoved == 0) {
+            return;
+        }
+    }
+    refreshResults();
+}
+
+void MainWindow::refreshResults() {
+    // The same search again, keeping the user's place in the list: the row
+    // at the top and the selected one, found again by path afterwards.
+    const int top = resultsView_->rowAt(0);
+    if (top >= 0) scrollAnchor_.topPath = QString::fromStdString(resultsModel_->recordAt(top).path);
+    const QModelIndex current = resultsView_->currentIndex();
+    if (current.isValid()) {
+        scrollAnchor_.selectedPath = QString::fromStdString(resultsModel_->recordAt(current.row()).path);
+    }
     runSearch();
+}
+
+void MainWindow::restoreScrollAnchor(const ScrollAnchor& anchor) {
+    if (anchor.topPath.isEmpty() && anchor.selectedPath.isEmpty()) return;
+    for (int row = 0; row < resultsModel_->rowCount(); ++row) {
+        const QString path = QString::fromStdString(resultsModel_->recordAt(row).path);
+        if (path == anchor.selectedPath) resultsView_->selectRow(row);
+        if (path == anchor.topPath) {
+            resultsView_->scrollTo(resultsModel_->index(row, 0), QAbstractItemView::PositionAtTop);
+        }
+    }
 }
 
 void MainWindow::updateIndexingStatus() {
@@ -788,6 +824,7 @@ void MainWindow::updateIndexingStatus() {
     bool anyPauseRequested = false;
     bool allPaused = true;
     bool anyFinishing = false;
+    bool onlyChecking = true;  // every active source is only checking for changes
     quint64 visitedSum = 0;
     quint64 totalSum = 0;
     double etaSeconds = -1;
@@ -824,6 +861,7 @@ void MainWindow::updateIndexingStatus() {
             fullLines << describeIndexing(root, s, rate.filesPerSecond, fm, false);
             allPaused = allPaused && s.paused;
             anyFinishing = anyFinishing || s.phase == IndexPhase::Finishing;
+            onlyChecking = onlyChecking && s.reconcile && s.phase != IndexPhase::Upgrading;
             etaSeconds = std::max(etaSeconds, secondsLeft(s, rate.filesPerSecond));
             visitedSum += std::min(s.filesVisited, s.filesTotal);
             totalSum += s.filesTotal;
@@ -863,8 +901,13 @@ void MainWindow::updateIndexingStatus() {
                           : totalSum == 0 ? 0
                                           : static_cast<int>(1000.0 * static_cast<double>(visitedSum) / totalSum);
         progressBar_->setValue(value);
-        progressBar_->setFormat(totalSum == 0 ? QStringLiteral("%p%")
-                                              : tr("%1 из %2 — %p%").arg(formatCount(visitedSum), formatCount(totalSum)));
+        // The startup check runs in the background while search already
+        // works on the index as it stands — say so, it's easy to take the
+        // bar for something to wait out.
+        const QString counts = totalSum == 0 ? QStringLiteral("%p%")
+                                             : tr("%1 из %2 — %p%").arg(formatCount(visitedSum), formatCount(totalSum));
+        progressBar_->setFormat(onlyChecking ? tr("Проверка изменений в фоне, поиск уже работает · %1").arg(counts)
+                                             : counts);
         // A style sheet (rather than the native look) so the text is drawn on
         // the bar on every platform — macOS's native bar shows no text.
         // Re-applied only when the colour actually changes.

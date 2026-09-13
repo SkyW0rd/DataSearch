@@ -39,6 +39,8 @@ private slots:
     void runSearch();
     void onIndexSelectedClicked();
     void onIndexFinished(const QString& rootLabel, bool cancelled);
+    // Re-runs the current search after the index changed under it.
+    void refreshResults();
     void updateIndexingStatus();
     void requestVisibleSnippets();
     void onResultsContextMenuRequested(const QPoint& pos);
@@ -112,6 +114,13 @@ private:
     Qt::TextElideMode pathElide_ = Qt::ElideMiddle;  // read by the path column's delegate
     // Results of anything but the latest search are dropped.
     quint64 searchRequest_ = 0;
+    // Where the user was in the list, restored when a refresh's results arrive.
+    struct ScrollAnchor {
+        QString topPath;
+        QString selectedPath;
+    };
+    ScrollAnchor scrollAnchor_;
+    void restoreScrollAnchor(const ScrollAnchor& anchor);
 
     // Excerpts are fetched only for rows on screen, after the results
     // themselves (building one re-reads the whole file's text). The

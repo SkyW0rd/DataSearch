@@ -83,6 +83,7 @@ void Indexer::launch(std::vector<std::filesystem::path> roots, ProgressCallback 
     filesTotal_.store(0);
     filesVisited_.store(0);
     filesWritten_.store(0);
+    filesRemoved_.store(0);
     filesFailed_.store(0);
     unreadableDirs_.store(0);
     extractionThreads_.store(0);
@@ -215,6 +216,7 @@ IndexerStatus Indexer::status() const {
     s.totalIsEstimate = totalIsEstimate_.load();
     s.filesVisited = filesVisited_.load();
     s.filesWritten = filesWritten_.load();
+    s.filesRemoved = filesRemoved_.load();
     s.filesFailed = filesFailed_.load();
     s.unreadableDirs = unreadableDirs_.load();
     s.extractionThreads = extractionThreads_.load();
@@ -686,6 +688,7 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
                 const auto removeStarted = Clock::now();
                 storage_.removeFile(path);
                 writingNs_ += nanosSince(removeStarted);
+                ++filesRemoved_;
             }
         }
     }
