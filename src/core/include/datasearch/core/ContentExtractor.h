@@ -32,6 +32,18 @@ struct ExtractionTiming {
     std::uint64_t bytesRead = 0;
 };
 
+// Why a file's text couldn't be extracted — for the list of such files the
+// user can review and retry. Stored in the index as its number, so values
+// must not be renumbered.
+enum class ExtractionProblem {
+    None = 0,        // text extracted, or the file simply has none (a scanned PDF)
+    CannotOpen = 1,  // couldn't be opened or read: no access, in use, I/O error
+    Damaged = 2,     // not a valid file of its type
+    Protected = 3,   // password-protected (encrypted DOCX/XLSX/PDF)
+    TooLarge = 4,    // over the ExtractionOptions limit; text not extracted
+    Failed = 5,      // extraction broke off with an error (e.g. out of memory)
+};
+
 // Best-effort plain-text extraction for the formats required by ТЗ п.3.1.1:
 //  - plain text / source code: read as-is (UTF-8 assumed).
 //  - .docx: text runs of the body, headers/footers, footnotes/endnotes,
@@ -58,11 +70,14 @@ struct ExtractionTiming {
 class ContentExtractor {
 public:
     static bool isSupportedExtension(const std::string& extensionLowercase);
-    // `timing`, if given, is added to (not reset).
+    // `timing`, if given, is added to (not reset). `problem`, if given, is
+    // set to why no text came out, or None. Errors while parsing escape as
+    // exceptions; callers report those as ExtractionProblem::Failed.
     static std::optional<std::string> extract(const std::filesystem::path& path,
                                                 const std::string& extensionLowercase,
                                                 const ExtractionOptions& options = {},
-                                                ExtractionTiming* timing = nullptr);
+                                                ExtractionTiming* timing = nullptr,
+                                                ExtractionProblem* problem = nullptr);
 };
 
 } // namespace datasearch::core

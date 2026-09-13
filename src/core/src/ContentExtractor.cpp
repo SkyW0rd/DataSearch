@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -256,6 +257,30 @@ private:
     std::vector<ZipEntry> entries_;
     ExtractionTiming* timing_ = nullptr;
 };
+
+// Why a DOCX/XLSX that isn't a readable ZIP archive failed: an encrypted
+// Office document is an OLE compound file instead (so is an old .doc/.xls
+// renamed to the new extension, which gets the same answer).
+ExtractionProblem zipOpenProblem(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return ExtractionProblem::CannotOpen;
+    unsigned char magic[8] = {};
+    in.read(reinterpret_cast<char*>(magic), sizeof(magic));
+    static const unsigned char kOle[8] = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
+    if (in.gcount() == 8 && std::equal(std::begin(magic), std::end(magic), std::begin(kOle))) {
+        return ExtractionProblem::Protected;
+    }
+    return ExtractionProblem::Damaged;
+}
+
+// A PDF names its encryption dictionary in the trailer; the header comes
+// first, within the first kilobyte by the spec's leniency.
+ExtractionProblem pdfProblem(const std::vector<std::uint8_t>& raw) {
+    const std::string_view bytes(reinterpret_cast<const char*>(raw.data()), raw.size());
+    if (bytes.substr(0, 1024).find("%PDF") == std::string_view::npos) return ExtractionProblem::Damaged;
+    if (bytes.find("/Encrypt") != std::string_view::npos) return ExtractionProblem::Protected;
+    return ExtractionProblem::None;
+}
 
 std::optional<std::vector<std::uint8_t>> readWholeFile(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
@@ -1304,10 +1329,18 @@ bool ContentExtractor::isSupportedExtension(const std::string& extensionLowercas
 std::optional<std::string> ContentExtractor::extract(const std::filesystem::path& path,
                                                        const std::string& extensionLowercase,
                                                        const ExtractionOptions& options,
-                                                       ExtractionTiming* timing) {
+                                                       ExtractionTiming* timing,
+                                                       ExtractionProblem* problem) {
+    ExtractionProblem ignored = ExtractionProblem::None;
+    ExtractionProblem& why = problem != nullptr ? *problem : ignored;
+    why = ExtractionProblem::None;
+
     std::error_code ec;
     const auto fileSize = std::filesystem::file_size(path, ec);
-    if (ec) return std::nullopt;
+    if (ec) {
+        why = ExtractionProblem::CannotOpen;
+        return std::nullopt;
+    }
 
     // DOCX/XLSX: only the XML parts that hold text are read; embedded images
     // (word/media, xl/media) never are, so the limit applies to those parts'
@@ -1315,7 +1348,10 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
     // however big the file is.
     if (extensionLowercase == ".docx" || extensionLowercase == ".xlsx") {
         ZipArchive archive;
-        if (!archive.open(path, timing)) return std::nullopt;
+        if (!archive.open(path, timing)) {
+            why = zipOpenProblem(path);
+            return std::nullopt;
+        }
         const bool docx = extensionLowercase == ".docx";
 
         std::vector<std::string> parts;
@@ -1334,7 +1370,10 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
                         hasPrefixAndXmlSuffix(name, "xl/diagrams/data"));
             if (wanted) parts.push_back(name);
         }
-        if (archive.unpackedSize(parts) > options.maxUnpackedBytes) return std::nullopt;
+        if (archive.unpackedSize(parts) > options.maxUnpackedBytes) {
+            why = ExtractionProblem::TooLarge;
+            return std::nullopt;
+        }
 
         auto append = [](std::string& out, const std::string& text) {
             if (text.empty()) return;
@@ -1345,7 +1384,10 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
         std::string out;
         if (docx) {
             auto doc = archive.readEntry("word/document.xml");
-            if (!doc) return std::nullopt;
+            if (!doc) {
+                why = ExtractionProblem::Damaged;
+                return std::nullopt;
+            }
             out = extractTextRuns(*doc, "w");
             // Headers, footers, footnotes, endnotes and comments share the
             // body's <w:t> markup; charts and SmartArt use DrawingML <a:t>.
@@ -1377,7 +1419,10 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
         return out.empty() ? std::nullopt : std::optional<std::string>(std::move(out));
     }
 
-    if (fileSize > options.maxBytes) return std::nullopt;
+    if (fileSize > options.maxBytes) {
+        why = ExtractionProblem::TooLarge;
+        return std::nullopt;
+    }
 
     if (extensionLowercase == ".pdf") {
         std::optional<std::vector<std::uint8_t>> raw;
@@ -1386,8 +1431,20 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
             raw = readWholeFile(path);
             if (raw) clock.setBytes(raw->size());
         }
-        if (!raw) return std::nullopt;
-        return extractPdfText(*raw);
+        if (!raw) {
+            why = ExtractionProblem::CannotOpen;
+            return std::nullopt;
+        }
+        // Encrypted streams (also in PDFs that open without a password but
+        // restrict copying) would decode to garbage, not text.
+        const ExtractionProblem found = pdfProblem(*raw);
+        if (found == ExtractionProblem::Protected) {
+            why = found;
+            return std::nullopt;
+        }
+        auto text = extractPdfText(*raw);
+        if (!text) why = found;
+        return text;
     }
 
     // Straight into the string that gets returned — not via a byte vector,
@@ -1396,7 +1453,10 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
     {
         ReadClock clock(timing);
         std::ifstream in(path, std::ios::binary);
-        if (!in) return std::nullopt;
+        if (!in) {
+            why = ExtractionProblem::CannotOpen;
+            return std::nullopt;
+        }
         text.assign(static_cast<std::size_t>(fileSize), '\0');
         in.read(text.data(), static_cast<std::streamsize>(text.size()));
         text.resize(static_cast<std::size_t>(in.gcount()));

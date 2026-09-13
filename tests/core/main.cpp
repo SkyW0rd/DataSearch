@@ -20,6 +20,7 @@ void runExactSearchTests();
 void runExactBackfillTests();
 void runNaturalOrderTests();
 void runSearchFilterTests();
+void runProblemFilesTests();
 
 namespace {
 
@@ -49,6 +50,7 @@ int main() {
         {"ExactBackfill", runExactBackfillTests},
         {"NaturalOrder", runNaturalOrderTests},
         {"SearchFilters", runSearchFilterTests},
+        {"ProblemFiles", runProblemFilesTests},
     };
 
     int failures = 0;

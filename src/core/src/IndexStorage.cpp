@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <ctime>
 #include <optional>
 #include <stdexcept>
 
@@ -69,6 +70,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
 );
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS problem_files (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    modified_time INTEGER NOT NULL,
+    problem INTEGER NOT NULL,
+    detail TEXT NOT NULL,
+    seen_at INTEGER NOT NULL
+);
 )SQL";
 
 // Exact-word index: contentless (the text itself is already stored once, in
@@ -442,6 +452,11 @@ void IndexStorage::upsertFile(const FileRecord& record, const std::string& conte
             throw std::runtime_error(std::string("Failed to update FTS index: ") + sqlite3_errmsg(db_));
         }
     }
+    {
+        Statement clear(db_, "DELETE FROM problem_files WHERE path = ?1;");
+        sqlite3_bind_text(clear, 1, record.path.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(clear);
+    }
     if (inExactIndex(rowId)) {
         Statement ins(db_, "INSERT INTO files_exact(rowid, name, content) VALUES (?1, ?2, ?3);");
         sqlite3_bind_int64(ins, 1, rowId);
@@ -547,6 +562,11 @@ void IndexStorage::removeFile(const std::string& path) {
         if (sqlite3_step(del) != SQLITE_DONE) {
             throw std::runtime_error(std::string("Failed to remove file: ") + sqlite3_errmsg(db_));
         }
+    }
+    {
+        Statement clear(db_, "DELETE FROM problem_files WHERE path = ?1;");
+        sqlite3_bind_text(clear, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(clear);
     }
 
     if (ownTransaction) commitBatch();
@@ -745,6 +765,41 @@ std::string IndexStorage::snippet(const std::string& path, const SearchQuery& qu
     if (sqlite3_step(stmt) != SQLITE_ROW) return {};
     const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
     return text != nullptr ? text : "";
+}
+
+void IndexStorage::recordProblem(const FileRecord& record, ExtractionProblem problem, const std::string& detail) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    Statement stmt(db_,
+                   "INSERT OR REPLACE INTO problem_files(path, size, modified_time, problem, detail, seen_at) "
+                   "VALUES(?1, ?2, ?3, ?4, ?5, ?6);");
+    sqlite3_bind_text(stmt, 1, record.path.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(record.size));
+    sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(record.modifiedTime));
+    sqlite3_bind_int(stmt, 4, static_cast<int>(problem));
+    sqlite3_bind_text(stmt, 5, detail.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 6, static_cast<sqlite3_int64>(std::time(nullptr)));
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to record a problem file: ") + sqlite3_errmsg(db_));
+    }
+}
+
+std::vector<ProblemFile> IndexStorage::problemFiles() const {
+    auto lock = lockRead();
+    std::vector<ProblemFile> out;
+    Statement stmt(readDb_,
+                   "SELECT path, size, modified_time, problem, detail, seen_at FROM problem_files "
+                   "ORDER BY path COLLATE ds_path;");
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        ProblemFile file;
+        file.path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        file.size = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 1));
+        file.modifiedTime = sqlite3_column_int64(stmt, 2);
+        file.problem = static_cast<ExtractionProblem>(sqlite3_column_int(stmt, 3));
+        file.detail = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+        file.seenAt = sqlite3_column_int64(stmt, 5);
+        out.push_back(std::move(file));
+    }
+    return out;
 }
 
 void IndexStorage::checkpoint() {

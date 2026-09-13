@@ -396,8 +396,8 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
             if (ContentExtractor::isSupportedExtension(ext)) {
                 ExtractionTiming extraction;
                 const auto started = Clock::now();
-                if (auto extracted =
-                        ContentExtractor::extract(pathFromUtf8(record.path), ext, extractionOptions_, &extraction)) {
+                if (auto extracted = ContentExtractor::extract(pathFromUtf8(record.path), ext, extractionOptions_,
+                                                               &extraction, &result.problem)) {
                     result.content = std::move(*extracted);
                 }
                 const std::uint64_t total = nanosSince(started);
@@ -411,35 +411,40 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
                 }
             }
         } catch (const std::exception& e) {
-            result.failed = true;
+            result.content.clear();
+            result.problem = ExtractionProblem::Failed;
             result.error = e.what();
         } catch (...) {
-            result.failed = true;
+            result.content.clear();
+            result.problem = ExtractionProblem::Failed;
             result.error = "unknown error";
         }
         return result;
     };
 
+    // A file whose text couldn't be extracted is still indexed, by name and
+    // metadata, and recorded as a problem file: it stays findable by name,
+    // the user can review and retry it, and the next startup check sees it
+    // as known and unchanged rather than new — before, it was left out and
+    // read all over again (a huge one, slowly) on every launch.
     auto writeFile = [&](Extracted item) {
         const FileRecord& record = item.record;
-        if (!item.failed) {
-            try {
-                const auto writeStarted = Clock::now();
-                storage_.upsertFile(record, item.content);
-                writingNs_ += nanosSince(writeStarted);
-            } catch (const std::exception& e) {
-                item.failed = true;
-                item.error = e.what();
-            } catch (...) {
-                item.failed = true;
-                item.error = "unknown error";
-            }
+        bool written = false;
+        try {
+            const auto writeStarted = Clock::now();
+            storage_.upsertFile(record, item.content);
+            if (item.problem != ExtractionProblem::None) storage_.recordProblem(record, item.problem, item.error);
+            writingNs_ += nanosSince(writeStarted);
+            written = true;
+        } catch (const std::exception& e) {
+            if (indexerOptions_.onFileError) indexerOptions_.onFileError(record.path, e.what());
+        } catch (...) {
+            if (indexerOptions_.onFileError) indexerOptions_.onFileError(record.path, "unknown error");
         }
-        if (item.failed) {
-            ++filesFailed_;
+        if (!written || item.problem != ExtractionProblem::None) ++filesFailed_;
+        if (!written) {
             ++filesVisited_;
             endFile();
-            if (indexerOptions_.onFileError) indexerOptions_.onFileError(record.path, item.error);
             return;
         }
 

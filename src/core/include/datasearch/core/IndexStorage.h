@@ -1,5 +1,6 @@
 #pragma once
 
+#include "datasearch/core/ContentExtractor.h"
 #include "datasearch/core/FileRecord.h"
 
 #include <cstdint>
@@ -50,6 +51,17 @@ struct SearchQuery {
     // interactive callers pass false and fetch excerpts per visible row
     // through IndexStorage::snippet().
     bool withSnippets = true;
+};
+
+// A file indexed without its text because it couldn't be read (see
+// IndexStorage::recordProblem).
+struct ProblemFile {
+    std::string path;
+    std::uint64_t size = 0;
+    std::int64_t modifiedTime = 0;
+    ExtractionProblem problem = ExtractionProblem::None;
+    std::string detail;       // the error's own text, for ExtractionProblem::Failed
+    std::int64_t seenAt = 0;  // when it was last tried, seconds since the epoch
 };
 
 // One SQLite database = the index for a single source (one disk/folder root —
@@ -106,6 +118,13 @@ public:
     std::string snippet(const std::string& path, const SearchQuery& query) const;
 
     std::uint64_t fileCount() const;
+
+    // Files whose text couldn't be extracted. Such a file is still indexed
+    // (upsertFile with no text) and then recorded here; like any indexed
+    // file, a startup check skips it while its size and time stay the same.
+    // Indexing it again (upsertFile) or removing it clears its entry.
+    void recordProblem(const FileRecord& record, ExtractionProblem problem, const std::string& detail = {});
+    std::vector<ProblemFile> problemFiles() const;
 
     // Moves everything from the write-ahead log into the database file and
     // truncates the log, which otherwise stays as big as the largest recent

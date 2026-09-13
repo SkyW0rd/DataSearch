@@ -491,4 +491,52 @@ void runContentExtractorTests() {
         DS_CHECK(extracted.has_value());
         DS_CHECK(contains(*extracted, "Found after noise"));
     }
+
+    // --- Why no text came out (the list of files that couldn't be read) ---
+    {
+        using datasearch::core::ExtractionProblem;
+        auto problemOf = [&](const std::filesystem::path& path, const std::string& ext,
+                             const ExtractionOptions& options = {}) {
+            ExtractionProblem problem = ExtractionProblem::Failed;
+            ContentExtractor::extract(path, ext, options, nullptr, &problem);
+            return problem;
+        };
+
+        writeFile(root / "fine.txt", "some text");
+        DS_CHECK(problemOf(root / "fine.txt", ".txt") == ExtractionProblem::None);
+        writeFile(root / "empty.txt", "");
+        DS_CHECK(problemOf(root / "empty.txt", ".txt") == ExtractionProblem::None);  // no text is not a problem
+        DS_CHECK(problemOf(root / "missing.docx", ".docx") == ExtractionProblem::CannotOpen);
+
+        ExtractionOptions tiny;
+        tiny.maxBytes = 4;
+        DS_CHECK(problemOf(root / "fine.txt", ".txt", tiny) == ExtractionProblem::TooLarge);
+
+        writeBinaryFile(root / "garbage.docx", std::string(5000, 'z'));
+        DS_CHECK(problemOf(root / "garbage.docx", ".docx") == ExtractionProblem::Damaged);
+        writeBinaryFile(root / "garbage.xlsx", "PK");
+        DS_CHECK(problemOf(root / "garbage.xlsx", ".xlsx") == ExtractionProblem::Damaged);
+        // An encrypted Office file is an OLE compound file, not a ZIP.
+        writeBinaryFile(root / "locked.xlsx", std::string("\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1", 8) + std::string(600, '\0'));
+        DS_CHECK(problemOf(root / "locked.xlsx", ".xlsx") == ExtractionProblem::Protected);
+        // A ZIP that isn't a Word document.
+        writeZip(root / "nobody.docx", {{"other.xml", "<x/>"}});
+        DS_CHECK(problemOf(root / "nobody.docx", ".docx") == ExtractionProblem::Damaged);
+        ExtractionOptions smallUnpacked;
+        smallUnpacked.maxUnpackedBytes = 10;
+        writeZip(root / "big.docx",
+                 {{"word/document.xml", "<w:document><w:body><w:p><w:r><w:t>plenty of words here</w:t></w:r></w:p>"
+                                        "</w:body></w:document>"}});
+        DS_CHECK(problemOf(root / "big.docx", ".docx") == ExtractionProblem::None);
+        DS_CHECK(problemOf(root / "big.docx", ".docx", smallUnpacked) == ExtractionProblem::TooLarge);
+
+        writeBinaryFile(root / "notpdf.pdf", "just some bytes, no header");
+        DS_CHECK(problemOf(root / "notpdf.pdf", ".pdf") == ExtractionProblem::Damaged);
+        const std::string encrypted =
+            "%PDF-1.4\n1 0 obj\n<< /Length 44 >>\nstream\nBT /F1 12 Tf 72 700 Td (Scrambled) Tj ET\nendstream\n"
+            "endobj\ntrailer\n<< /Root 1 0 R /Encrypt 2 0 R >>\n%%EOF\n";
+        writeBinaryFile(root / "encrypted.pdf", encrypted);
+        DS_CHECK(problemOf(root / "encrypted.pdf", ".pdf") == ExtractionProblem::Protected);
+        DS_CHECK(!ContentExtractor::extract(root / "encrypted.pdf", ".pdf").has_value());  // no garbage text
+    }
 }

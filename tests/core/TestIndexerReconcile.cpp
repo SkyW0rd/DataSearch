@@ -155,3 +155,80 @@ void runIndexerUnavailableRootTests() {
     auto all = storage.allRecords();
     DS_CHECK_EQ(all.size(), std::size_t{2});
 }
+
+// A file whose text can't be read is indexed by name and listed as a
+// problem file; startup checks skip it while it stays the same, and once it
+// changes it's read again and drops off the list.
+void runProblemFilesTests() {
+    const auto root = makeScratchDir();
+    struct Cleanup {
+        std::filesystem::path p;
+        ~Cleanup() { std::filesystem::remove_all(p); }
+    } cleanup{root};
+
+    const auto t0 = std::filesystem::file_time_type::clock::now() - std::chrono::hours(2);
+    const auto t1 = t0 + std::chrono::hours(1);
+    writeFileAt(root / "good.txt", "ordinary words", t0);
+    writeFileAt(root / "report broken.docx", std::string(4000, 'z'), t0);
+    writeFileAt(root / "huge notes.txt", std::string(200, 'q'), t0);
+
+    ExtractionOptions limits;
+    limits.maxBytes = 100;  // huge notes.txt is over it
+    IndexStorage storage(":memory:");
+    std::vector<std::string> writeErrors;
+    IndexerOptions options;
+    options.onFileError = [&](const std::string& path, const std::string&) { writeErrors.push_back(path); };
+    Indexer indexer(storage, ScanOptions{}, limits, options);
+    indexer.start({root});
+    indexer.join();
+
+    DS_CHECK_EQ(storage.fileCount(), std::uint64_t{3});  // all three, problem files included
+    DS_CHECK_EQ(indexer.status().filesFailed, std::uint64_t{2});
+    DS_CHECK(writeErrors.empty());  // not writing errors: the list covers them
+    {
+        const auto problems = storage.problemFiles();
+        DS_CHECK_EQ(problems.size(), std::size_t{2});
+        DS_CHECK(problems[0].path.find("huge notes.txt") != std::string::npos);
+        DS_CHECK(problems[0].problem == ExtractionProblem::TooLarge);
+        DS_CHECK(problems[1].path.find("report broken.docx") != std::string::npos);
+        DS_CHECK(problems[1].problem == ExtractionProblem::Damaged);
+        DS_CHECK_EQ(problems[1].size, std::uint64_t{4000});
+        DS_CHECK(problems[1].seenAt > 0);
+    }
+    // Findable by name.
+    SearchQuery byName;
+    byName.namePattern = "broken";
+    byName.limit = 10;
+    DS_CHECK_EQ(storage.search(byName).size(), std::size_t{1});
+
+    // Startup checks leave them alone while they're unchanged.
+    for (int run = 0; run < 2; ++run) {
+        indexer.startReconcile({root});
+        indexer.join();
+        DS_CHECK_EQ(indexer.status().filesWritten, std::uint64_t{0});
+        DS_CHECK_EQ(indexer.status().filesFailed, std::uint64_t{0});
+        DS_CHECK_EQ(storage.problemFiles().size(), std::size_t{2});
+    }
+
+    // Once it's fixed (changed on disk), it's read again and off the list.
+    writeFileAt(root / "huge notes.txt", "short now", t1);
+    indexer.startReconcile({root});
+    indexer.join();
+    DS_CHECK_EQ(indexer.status().filesWritten, std::uint64_t{1});
+    {
+        const auto problems = storage.problemFiles();
+        DS_CHECK_EQ(problems.size(), std::size_t{1});
+        DS_CHECK(problems[0].path.find("report broken.docx") != std::string::npos);
+    }
+    SearchQuery byText;
+    byText.namePattern = "short";
+    byText.limit = 10;
+    DS_CHECK_EQ(storage.search(byText).size(), std::size_t{1});
+
+    // A deleted problem file leaves the list too.
+    std::filesystem::remove(root / "report broken.docx");
+    indexer.startReconcile({root});
+    indexer.join();
+    DS_CHECK_EQ(indexer.status().filesRemoved, std::uint64_t{1});
+    DS_CHECK(storage.problemFiles().empty());
+}

@@ -52,10 +52,12 @@ struct IndexerStatus {
     // the index held before the pass — an estimate (`totalIsEstimate`).
     std::uint64_t filesTotal = 0;
     bool totalIsEstimate = false;
-    std::uint64_t filesVisited = 0;  // written + unchanged + failed
+    std::uint64_t filesVisited = 0;  // written + unchanged + failed to write
     std::uint64_t filesWritten = 0;
     // Reconcile only: indexed files no longer on disk, dropped from the index.
     std::uint64_t filesRemoved = 0;
+    // Files whose text couldn't be extracted (indexed by name, and listed by
+    // IndexStorage::problemFiles()) or that couldn't be written to the index.
     std::uint64_t filesFailed = 0;
     // Folders that couldn't be read (no access, path too long, I/O error).
     // Their contents are unknown this run; a reconcile pass leaves whatever
@@ -156,10 +158,11 @@ struct IndexerOptions {
     // defer.
     std::uint64_t heavyFileThreshold = 20ull * 1024 * 1024;
 
-    // Called (on a worker thread) when extracting or storing one file throws
-    // — a malformed document, a filesystem-level error mid-read, etc. That
-    // file is skipped (left as-is in the index if it was already there); the
-    // scan continues with the rest. Optional — indexing works without it.
+    // Called (on a worker thread) when writing one file to the index fails.
+    // That file is skipped (left as-is in the index if it was already there);
+    // the scan continues with the rest. Files whose text couldn't be read
+    // aren't reported here: they're indexed by name and listed by
+    // IndexStorage::problemFiles(). Optional — indexing works without it.
     std::function<void(const std::string& path, const std::string& what)> onFileError;
 };
 
@@ -290,8 +293,8 @@ private:
     struct Extracted {
         FileRecord record;
         std::string content;
-        bool failed = false;
-        std::string error;
+        ExtractionProblem problem = ExtractionProblem::None;
+        std::string error;  // the exception's text, for ExtractionProblem::Failed
     };
     void runInternal(std::vector<std::filesystem::path> roots,
                       ProgressCallback onProgress,
