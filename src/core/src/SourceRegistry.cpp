@@ -1,5 +1,7 @@
 #include "datasearch/core/SourceRegistry.h"
 
+#include "datasearch/core/Utf8.h"
+
 #include <sqlite3.h>
 
 #include <stdexcept>
@@ -38,7 +40,8 @@ void execOrThrow(sqlite3* db, const char* sql) {
 } // namespace
 
 SourceRegistry::SourceRegistry(const std::filesystem::path& registryDbPath) {
-    if (sqlite3_open(registryDbPath.string().c_str(), &db_) != SQLITE_OK) {
+    // UTF-8, as SQLite expects — see IndexStorage.
+    if (sqlite3_open(pathToUtf8(registryDbPath).c_str(), &db_) != SQLITE_OK) {
         std::string message = db_ != nullptr ? sqlite3_errmsg(db_) : "sqlite3_open failed";
         if (db_ != nullptr) sqlite3_close(db_);
         db_ = nullptr;

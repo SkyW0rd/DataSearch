@@ -10,6 +10,7 @@ add_executable(datasearch_core_tests
   core/TestSearchQueryParser.cpp
   core/TestIndexerPauseResume.cpp
   core/TestSearchPerformance.cpp
+  core/TestExactSearch.cpp
 )
 
 target_link_libraries(datasearch_core_tests PRIVATE datasearch_core)

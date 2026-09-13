@@ -15,11 +15,13 @@ namespace {
 struct TokenizerRegistration {
     fts5_tokenizer inner{};
     void* innerUserData = nullptr;
+    bool stem = true;  // false: "ru_exact" — casefold and ё→е only
 };
 
 struct RussianTokenizerContext {
     fts5_tokenizer inner{};
     Fts5Tokenizer* innerInstance = nullptr;
+    bool stem = true;
 };
 
 // Bridges the inner (unicode61) tokenizer's xToken callback: stems each token
@@ -35,10 +37,26 @@ int forwardStemmedToken(void* pCtx, int tflags, const char* pToken, int nToken, 
     return ctx->outerXToken(ctx->outerCtx, tflags, stemmed.data(), static_cast<int>(stemmed.size()), iStart, iEnd);
 }
 
+// The same token with every "ё" folded to "е" (both two bytes in UTF-8, so in
+// place) — Russian text uses the two interchangeably, and a search for
+// "еще" must find "ещё". unicode61 has already lowercased it.
+int forwardExactToken(void* pCtx, int tflags, const char* pToken, int nToken, int iStart, int iEnd) {
+    auto* ctx = static_cast<ForwardCallbackContext*>(pCtx);
+    std::string token(pToken, static_cast<std::size_t>(nToken));
+    for (std::size_t i = 0; i + 1 < token.size(); ++i) {
+        if (static_cast<unsigned char>(token[i]) == 0xD1 && static_cast<unsigned char>(token[i + 1]) == 0x91) {
+            token[i] = static_cast<char>(0xD0);
+            token[i + 1] = static_cast<char>(0xB5);
+        }
+    }
+    return ctx->outerXToken(ctx->outerCtx, tflags, token.data(), static_cast<int>(token.size()), iStart, iEnd);
+}
+
 int xCreate(void* pUserData, const char** azArg, int nArg, Fts5Tokenizer** ppOut) {
     auto* registration = static_cast<TokenizerRegistration*>(pUserData);
     auto* ctx = new RussianTokenizerContext();
     ctx->inner = registration->inner;
+    ctx->stem = registration->stem;
 
     const int rc = ctx->inner.xCreate(registration->innerUserData, azArg, nArg, &ctx->innerInstance);
     if (rc != SQLITE_OK) {
@@ -60,7 +78,8 @@ int xTokenize(Fts5Tokenizer* pTokenizer, void* pCtx, int flags, const char* pTex
               int (*xToken)(void*, int, const char*, int, int, int)) {
     auto* ctx = reinterpret_cast<RussianTokenizerContext*>(pTokenizer);
     ForwardCallbackContext forwardCtx{pCtx, xToken};
-    return ctx->inner.xTokenize(ctx->innerInstance, &forwardCtx, flags, pText, nText, forwardStemmedToken);
+    return ctx->inner.xTokenize(ctx->innerInstance, &forwardCtx, flags, pText, nText,
+                                ctx->stem ? forwardStemmedToken : forwardExactToken);
 }
 
 fts5_api* fetchFts5Api(sqlite3* db) {
@@ -79,23 +98,26 @@ bool registerRussianFts5Tokenizer(sqlite3* db) {
     fts5_api* api = fetchFts5Api(db);
     if (api == nullptr) return false;
 
-    auto* registration = new TokenizerRegistration();
-    if (api->xFindTokenizer(api, "unicode61", &registration->innerUserData, &registration->inner) != SQLITE_OK) {
-        delete registration;
-        return false;
-    }
+    for (const bool stem : {true, false}) {
+        auto* registration = new TokenizerRegistration();
+        registration->stem = stem;
+        if (api->xFindTokenizer(api, "unicode61", &registration->innerUserData, &registration->inner) != SQLITE_OK) {
+            delete registration;
+            return false;
+        }
 
-    fts5_tokenizer ourVtable{};
-    ourVtable.xCreate = &xCreate;
-    ourVtable.xDelete = &xDelete;
-    ourVtable.xTokenize = &xTokenize;
+        fts5_tokenizer ourVtable{};
+        ourVtable.xCreate = &xCreate;
+        ourVtable.xDelete = &xDelete;
+        ourVtable.xTokenize = &xTokenize;
 
-    const int rc = api->xCreateTokenizer(
-        api, "ru_snowball", registration, &ourVtable,
-        [](void* p) { delete static_cast<TokenizerRegistration*>(p); });
-    if (rc != SQLITE_OK) {
-        delete registration;
-        return false;
+        const int rc = api->xCreateTokenizer(
+            api, stem ? "ru_snowball" : "ru_exact", registration, &ourVtable,
+            [](void* p) { delete static_cast<TokenizerRegistration*>(p); });
+        if (rc != SQLITE_OK) {
+            delete registration;
+            return false;
+        }
     }
     return true;
 }

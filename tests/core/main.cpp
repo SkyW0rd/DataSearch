@@ -16,6 +16,8 @@ void runIndexerUnavailableRootTests();
 void runIndexerPauseResumeTests();
 void runSearchPerformanceTests();
 void runSearchQueryParserTests();
+void runExactSearchTests();
+void runExactBackfillTests();
 
 namespace {
 
@@ -41,6 +43,8 @@ int main() {
         {"IndexerPauseResume", runIndexerPauseResumeTests},
         {"SearchPerformance", runSearchPerformanceTests},
         {"SearchQueryParser", runSearchQueryParserTests},
+        {"ExactSearch", runExactSearchTests},
+        {"ExactBackfill", runExactBackfillTests},
     };
 
     int failures = 0;

@@ -62,4 +62,10 @@ std::vector<FileRecord> SearchEngine::search(const SearchQuery& query) const {
     return std::vector<FileRecord>(begin, end);
 }
 
+std::uint64_t SearchEngine::countMatches(const SearchQuery& query) const {
+    std::uint64_t total = 0;
+    for (IndexStorage* source : sources_) total += source->countMatches(query);
+    return total;
+}
+
 } // namespace datasearch::core

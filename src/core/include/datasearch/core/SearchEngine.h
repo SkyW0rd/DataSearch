@@ -2,6 +2,7 @@
 
 #include "datasearch/core/IndexStorage.h"
 
+#include <cstdint>
 #include <vector>
 
 namespace datasearch::core {
@@ -14,6 +15,9 @@ public:
     explicit SearchEngine(std::vector<IndexStorage*> sources);
 
     std::vector<FileRecord> search(const SearchQuery& query) const;
+
+    // Matches across all sources, ignoring limit/offset.
+    std::uint64_t countMatches(const SearchQuery& query) const;
 
 private:
     std::vector<IndexStorage*> sources_;
