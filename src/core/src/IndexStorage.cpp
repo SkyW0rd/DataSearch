@@ -1,6 +1,7 @@
 #include "datasearch/core/IndexStorage.h"
 
 #include "datasearch/core/Fts5RussianTokenizer.h"
+#include "datasearch/core/NaturalOrder.h"
 #include "datasearch/core/SearchQueryParser.h"
 #include "datasearch/core/Utf8.h"
 
@@ -209,20 +210,23 @@ std::string exactSnippet(const std::string& text, const std::vector<std::u32stri
     return out;
 }
 
-const char* sortColumnPlain(SortField field) {
-    switch (field) {
-        case SortField::ModifiedTime: return "modified_time";
-        case SortField::Size: return "size";
-        default: return "name COLLATE NOCASE";
-    }
-}
-
-std::string sortColumnFts(SortField field, const std::string& table) {
-    switch (field) {
-        case SortField::ModifiedTime: return "f.modified_time";
-        case SortField::Size: return "f.size";
-        case SortField::Name: return "f.name COLLATE NOCASE";
-        default: return "bm25(" + table + ", 10.0, 1.0)";
+// The ORDER BY clause. `ftsTable` is empty for the plain scan over `files`
+// (no search words), where "by relevance" lists by name through the index
+// on name — an instant first page even for hundreds of thousands of files.
+// By path, the collation itself holds the direction (folders stay before
+// files either way), so it's always ASC.
+std::string orderBy(const SearchQuery& query, const std::string& ftsTable) {
+    const std::string direction = query.sortOrder == SortOrder::Descending ? " DESC" : " ASC";
+    switch (query.sortField) {
+        case SortField::ModifiedTime: return "f.modified_time" + direction;
+        case SortField::Size: return "f.size" + direction;
+        case SortField::Name: return "f.name COLLATE ds_path" + direction;
+        case SortField::Path:
+            return std::string("f.path COLLATE ") +
+                   pathCollation({query.foldersFirst, query.sortOrder == SortOrder::Descending}) + " ASC";
+        default:
+            return ftsTable.empty() ? "f.name COLLATE NOCASE" + direction
+                                    : "bm25(" + ftsTable + ", 10.0, 1.0)" + direction;
     }
 }
 
@@ -302,7 +306,7 @@ IndexStorage::IndexStorage(const std::filesystem::path& dbPath) {
     execOrThrow(db_, "PRAGMA synchronous=NORMAL;");
     execOrThrow(db_, "PRAGMA foreign_keys=ON;");
 
-    if (!registerRussianFts5Tokenizer(db_)) {
+    if (!registerRussianFts5Tokenizer(db_) || !registerPathCollations(db_)) {
         sqlite3_close(db_);
         db_ = nullptr;
         throw std::runtime_error("Failed to register the 'ru_snowball' FTS5 tokenizer "
@@ -328,7 +332,8 @@ IndexStorage::IndexStorage(const std::filesystem::path& dbPath) {
     readDb_ = db_;
     if (!pathText.empty() && pathText != ":memory:") {
         sqlite3* reader = nullptr;
-        if (sqlite3_open(pathText.c_str(), &reader) == SQLITE_OK && registerRussianFts5Tokenizer(reader)) {
+        if (sqlite3_open(pathText.c_str(), &reader) == SQLITE_OK && registerRussianFts5Tokenizer(reader) &&
+            registerPathCollations(reader)) {
             execOrThrow(reader, "PRAGMA query_only=1;");
             readDb_ = reader;
         } else if (reader != nullptr) {
@@ -569,6 +574,8 @@ struct QueryPlan {
     std::string negativeExpr;
     std::optional<std::string> extensionFilter;
     std::string likePattern;
+    std::vector<std::string> extensions;
+    std::int64_t modifiedSince = 0;
     std::vector<std::string> extraWhere;
 };
 
@@ -588,6 +595,14 @@ QueryPlan planQuery(const SearchQuery& query) {
     }
     if (plan.extensionFilter) plan.extraWhere.push_back("LOWER(f.ext) = ?");
     if (parsed.pathFilter) plan.extraWhere.push_back("f.path LIKE ? ESCAPE '\\'");
+    plan.extensions = query.extensions;
+    if (!plan.extensions.empty()) {
+        std::string in = "LOWER(f.ext) IN (?";
+        for (std::size_t i = 1; i < plan.extensions.size(); ++i) in += ", ?";
+        plan.extraWhere.push_back(in + ")");
+    }
+    plan.modifiedSince = query.modifiedSince;
+    if (plan.modifiedSince > 0) plan.extraWhere.push_back("f.modified_time >= ?");
     return plan;
 }
 
@@ -595,6 +610,8 @@ void bindExtras(const QueryPlan& plan, sqlite3_stmt* stmt, int& idx) {
     if (!plan.negativeExpr.empty()) sqlite3_bind_text(stmt, idx++, plan.negativeExpr.c_str(), -1, SQLITE_TRANSIENT);
     if (plan.extensionFilter) sqlite3_bind_text(stmt, idx++, plan.extensionFilter->c_str(), -1, SQLITE_TRANSIENT);
     if (!plan.likePattern.empty()) sqlite3_bind_text(stmt, idx++, plan.likePattern.c_str(), -1, SQLITE_TRANSIENT);
+    for (const auto& ext : plan.extensions) sqlite3_bind_text(stmt, idx++, ext.c_str(), -1, SQLITE_TRANSIENT);
+    if (plan.modifiedSince > 0) sqlite3_bind_int64(stmt, idx++, plan.modifiedSince);
 }
 
 std::string joinWhere(const std::vector<std::string>& clauses, const char* leading) {
@@ -642,8 +659,7 @@ std::vector<FileRecord> IndexStorage::search(const SearchQuery& query) const {
         sql += "bm25(" + t + ", 10.0, 1.0) FROM " + t + " JOIN files f ON f.id = " + t + ".rowid WHERE " + t +
                " MATCH ?";
         sql += joinWhere(plan.extraWhere, " AND ");
-        sql += " ORDER BY " + sortColumnFts(query.sortField, t);
-        sql += query.sortOrder == SortOrder::Descending ? " DESC" : " ASC";
+        sql += " ORDER BY " + orderBy(query, t);
         sql += " LIMIT ? OFFSET ?;";
 
         Statement stmt(readDb_, sql.c_str());
@@ -674,9 +690,7 @@ std::vector<FileRecord> IndexStorage::search(const SearchQuery& query) const {
     // were given.
     std::string sql = "SELECT path, name, ext, size, created_time, modified_time FROM files f";
     sql += joinWhere(plan.extraWhere, " WHERE ");
-    sql += " ORDER BY ";
-    sql += sortColumnPlain(query.sortField);
-    sql += query.sortOrder == SortOrder::Descending ? " DESC" : " ASC";
+    sql += " ORDER BY " + orderBy(query, {});
     sql += " LIMIT ? OFFSET ?;";
 
     Statement stmt(readDb_, sql.c_str());

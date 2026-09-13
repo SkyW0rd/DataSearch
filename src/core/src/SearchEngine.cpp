@@ -1,24 +1,19 @@
 #include "datasearch/core/SearchEngine.h"
 
+#include "datasearch/core/NaturalOrder.h"
+
 #include <algorithm>
-#include <cctype>
 
 namespace datasearch::core {
 
 namespace {
 
-std::string toLowerCopy(const std::string& s) {
-    std::string out = s;
-    std::transform(out.begin(), out.end(), out.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return out;
-}
-
+// The same orders the "ds_path" collation gives each source's SQL query.
 bool less(const FileRecord& a, const FileRecord& b, SortField field) {
     switch (field) {
         case SortField::ModifiedTime: return a.modifiedTime < b.modifiedTime;
         case SortField::Size: return a.size < b.size;
-        case SortField::Name: return toLowerCopy(a.name) < toLowerCopy(b.name);
+        case SortField::Name: return comparePaths(a.name, b.name) < 0;
         // bm25() is "smaller is more relevant" by FTS5 convention; comparing
         // raw scores across independently-ranked per-disk indexes is an
         // approximation (each index's term/document statistics differ), the
@@ -50,9 +45,16 @@ std::vector<FileRecord> SearchEngine::search(const SearchQuery& query) const {
     }
 
     const bool descending = query.sortOrder == SortOrder::Descending;
-    std::sort(merged.begin(), merged.end(), [&](const FileRecord& a, const FileRecord& b) {
-        return descending ? less(b, a, query.sortField) : less(a, b, query.sortField);
-    });
+    if (query.sortField == SortField::Path) {
+        // The direction is part of the order here: folders stay first.
+        const PathOrder order{query.foldersFirst, descending};
+        std::sort(merged.begin(), merged.end(),
+                  [&](const FileRecord& a, const FileRecord& b) { return comparePaths(a.path, b.path, order) < 0; });
+    } else {
+        std::sort(merged.begin(), merged.end(), [&](const FileRecord& a, const FileRecord& b) {
+            return descending ? less(b, a, query.sortField) : less(a, b, query.sortField);
+        });
+    }
 
     if (static_cast<std::size_t>(query.offset) >= merged.size()) return {};
 

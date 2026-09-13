@@ -12,7 +12,9 @@ struct sqlite3;
 
 namespace datasearch::core {
 
-enum class SortField { Relevance, Name, ModifiedTime, Size };
+// Name and Path use the natural order of NaturalOrder.h; Path groups files
+// by folder (see SearchQuery::foldersFirst).
+enum class SortField { Relevance, Name, ModifiedTime, Size, Path };
 enum class SortOrder { Ascending, Descending };
 
 struct SearchQuery {
@@ -25,12 +27,23 @@ struct SearchQuery {
     SortOrder sortOrder = SortOrder::Ascending;
     int limit = 200;
     int offset = 0;
+    // By path: in each folder, its subfolders before its own files (as in
+    // Explorer), or its files first. Descending keeps this grouping.
+    bool foldersFirst = true;
 
     // true: whole words exactly as typed, case- and ё/е-insensitive
     // ("Михайлов" finds "михайлов", not "Михайлова"/"Михайленко"). false:
     // Russian word forms and prefixes too (ТЗ п.11.3: "практикум" finds
     // "практикума"; "практик" finds "практикум").
     bool exactWords = false;
+
+    // Only files with one of these extensions (lowercase, with the dot:
+    // ".docx"); empty means any. Combined with an ext: operator, if the
+    // text has one, as "both must hold".
+    std::vector<std::string> extensions;
+    // Only files modified at or after this moment (seconds since the
+    // epoch); 0 means any time.
+    std::int64_t modifiedSince = 0;
 
     // Highlighted excerpts in search() results. Building one means re-reading
     // that file's whole text, which for a few hundred matches took seconds —

@@ -18,6 +18,8 @@ void runSearchPerformanceTests();
 void runSearchQueryParserTests();
 void runExactSearchTests();
 void runExactBackfillTests();
+void runNaturalOrderTests();
+void runSearchFilterTests();
 
 namespace {
 
@@ -45,6 +47,8 @@ int main() {
         {"SearchQueryParser", runSearchQueryParserTests},
         {"ExactSearch", runExactSearchTests},
         {"ExactBackfill", runExactBackfillTests},
+        {"NaturalOrder", runNaturalOrderTests},
+        {"SearchFilters", runSearchFilterTests},
     };
 
     int failures = 0;

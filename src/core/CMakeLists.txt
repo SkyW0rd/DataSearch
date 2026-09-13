@@ -43,6 +43,7 @@ add_library(datasearch_core STATIC
   src/Fts5RussianTokenizer.cpp
   src/SourceRegistry.cpp
   src/SearchQueryParser.cpp
+  src/NaturalOrder.cpp
 )
 
 target_include_directories(datasearch_core PUBLIC
