@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -257,39 +259,68 @@ void runIndexerLockedIndexTests() {
     options.onFileError = [&](const std::string& path, const std::string&) { errors.push_back(path); };
     Indexer indexer(storage, ScanOptions{}, ExtractionOptions{}, options);
 
-    auto holdFor = [&](std::chrono::milliseconds hold) {
-        sqlite3* other = nullptr;
-        sqlite3_open(pathToUtf8(dbPath).c_str(), &other);
-        sqlite3_exec(other, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
-        return std::thread([other, hold] {
-            std::this_thread::sleep_for(hold);
-            sqlite3_exec(other, "COMMIT;", nullptr, nullptr, nullptr);
-            sqlite3_close(other);
-        });
+    // Another connection takes the index's write lock (waiting for it if
+    // need be) and keeps it until released — by the test once the run is
+    // over, not after a guessed time a slow machine could outlast.
+    struct OtherWriter {
+        sqlite3* db = nullptr;
+        bool locked = false;
+        std::thread releaser;
+        explicit OtherWriter(const std::filesystem::path& path) {
+            sqlite3_open(pathToUtf8(path).c_str(), &db);
+            sqlite3_busy_timeout(db, 10000);
+            locked = sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) == SQLITE_OK;
+        }
+        void releaseAfter(std::chrono::milliseconds delay) {
+            releaser = std::thread([this, delay] {
+                std::this_thread::sleep_for(delay);
+                release();
+            });
+        }
+        void release() {
+            if (db == nullptr) return;
+            sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+            sqlite3_close(db);
+            db = nullptr;
+        }
+        ~OtherWriter() {
+            if (releaser.joinable()) releaser.join();
+            release();
+        }
     };
 
     {
-        auto holder = holdFor(std::chrono::milliseconds(500));
+        OtherWriter other(dbPath);
+        DS_CHECK(other.locked);
+        other.releaseAfter(std::chrono::milliseconds(500));  // well within the 3 s wait
         bool cancelled = true;
         indexer.start({root / "docs"}, nullptr, [&](bool c) { cancelled = c; });
         indexer.join();
-        holder.join();
         DS_CHECK(!cancelled);
         DS_CHECK_EQ(storage.fileCount(), std::uint64_t{3});
         DS_CHECK(errors.empty());
     }
     {
         writeFileAt(root / "docs" / "d.txt", "more words", t0);
-        auto holder = holdFor(std::chrono::milliseconds(4500));
+        OtherWriter other(dbPath);
+        DS_CHECK(other.locked);
         bool completed = false, cancelled = false;
         indexer.startReconcile({root / "docs"}, nullptr, [&](bool c) {
             completed = true;
             cancelled = c;
         });
-        indexer.join();
-        holder.join();
+        const auto started = std::chrono::steady_clock::now();
+        indexer.join();  // gives up after its 3 s wait while the lock is still held
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+        other.release();
         DS_CHECK(completed);
-        DS_CHECK(cancelled);
+        if (!cancelled) {
+            // Say what happened, so a failure on another machine can be told apart.
+            throw std::runtime_error("run went through while the index was locked: waited " +
+                                     std::to_string(waited.count()) + " ms, written " +
+                                     std::to_string(indexer.status().filesWritten) + ", errors " +
+                                     std::to_string(errors.size()) + ", sqlite " + sqlite3_libversion());
+        }
         DS_CHECK(indexer.status().phase == IndexPhase::Finished);
         DS_CHECK(!errors.empty() && errors.back().empty());  // reported as a whole-run error
     }
