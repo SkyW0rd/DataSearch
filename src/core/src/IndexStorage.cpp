@@ -295,6 +295,10 @@ IndexStorage::IndexStorage(const std::filesystem::path& dbPath) {
     // WAL + NORMAL sync: readers never block on a writer, and a crash mid-write
     // can't corrupt the database (ТЗ NFR-5) — the last committed transaction stands.
     execOrThrow(db_, "PRAGMA journal_mode=WAL;");
+    // The WAL file otherwise keeps the size of the largest transaction it has
+    // held (a batch with a huge document: hundreds of MB) for as long as the
+    // database is open; this trims it back after each checkpoint.
+    execOrThrow(db_, "PRAGMA journal_size_limit=67108864;");
     execOrThrow(db_, "PRAGMA synchronous=NORMAL;");
     execOrThrow(db_, "PRAGMA foreign_keys=ON;");
 
@@ -727,6 +731,12 @@ std::string IndexStorage::snippet(const std::string& path, const SearchQuery& qu
     if (sqlite3_step(stmt) != SQLITE_ROW) return {};
     const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
     return text != nullptr ? text : "";
+}
+
+void IndexStorage::checkpoint() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (inBatch_) return;
+    sqlite3_exec(db_, "PRAGMA wal_checkpoint(TRUNCATE);", nullptr, nullptr, nullptr);
 }
 
 std::uint64_t IndexStorage::fileCount() const {

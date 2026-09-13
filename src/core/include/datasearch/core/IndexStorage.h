@@ -94,6 +94,12 @@ public:
 
     std::uint64_t fileCount() const;
 
+    // Moves everything from the write-ahead log into the database file and
+    // truncates the log, which otherwise stays as big as the largest recent
+    // transaction until the next write. Best effort: a no-op while a search
+    // is reading.
+    void checkpoint();
+
     // Filling `files_exact` for an index created before it existed: files
     // still to do, and one step of at most `maxRows` files (returns how many
     // were done; 0 once complete). Until it finishes, exact-word search only
