@@ -23,6 +23,8 @@
 #include <QMenuBar>
 #include <QUrl>
 #include <QColor>
+#include <QDate>
+#include <QDateTime>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -42,6 +44,7 @@
 #include <QSettings>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QStyledItemDelegate>
 #include <QTableView>
 #include <QVBoxLayout>
 
@@ -49,16 +52,150 @@ using datasearch::core::IndexerStatus;
 using namespace display;
 using datasearch::core::IndexPhase;
 using datasearch::core::SearchQuery;
+using datasearch::core::SortField;
 using datasearch::platform::VolumeType;
 
 namespace {
 const char* kSettingsExcludeMasksKey = "excludeMasks";
 const char* kSettingsWordFormsKey = "searchWordForms";
 const char* kSettingsReadThreadsKey = "readThreads";
+const char* kSettingsSortKey = "resultsSort";
+const char* kSettingsSortDescendingKey = "resultsSortDescending";
+const char* kSettingsFoldersFirstKey = "foldersFirst";
+const char* kSettingsTypeFilterKey = "filterType";
+const char* kSettingsDateFilterKey = "filterDate";
+const char* kSettingsPathElideKey = "pathElide";
+constexpr int kPathColumnWidth = 380;
 constexpr int kResultLimit = 2000;
 const char* kDefaultExcludeMasks = "*.tmp, node_modules, .git";
 constexpr int kFileNameWidth = 480;
 constexpr int kNoticeWidth = 320;
+
+struct SortChoice {
+    SortField field;
+    const char* settingsValue;
+    int column;            // the results column it sorts by, -1 for none
+    bool descendingFirst;  // newest / largest on top unless reversed
+};
+const SortChoice kSortChoices[] = {
+    {SortField::Relevance, "relevance", -1, false},
+    {SortField::Path, "path", ResultsTableModel::ColumnPath, false},
+    {SortField::Name, "name", ResultsTableModel::ColumnName, false},
+    {SortField::ModifiedTime, "modified", ResultsTableModel::ColumnModified, true},
+    {SortField::Size, "size", ResultsTableModel::ColumnSize, true},
+};
+
+// The "Сортировка" menu, grouped by field. The first run starts with the
+// Explorer-like order: by folder, А to Я, subfolders before files.
+struct SortMenuItem {
+    SortField field;
+    bool descending;
+    const char* text;
+};
+const SortMenuItem kSortMenu[] = {
+    {SortField::Relevance, false, "По релевантности — сначала лучшие совпадения"},
+    {SortField::Path, false, "По папкам — от А до Я (по умолчанию)"},
+    {SortField::Path, true, "По папкам — от Я до А"},
+    {SortField::Name, false, "По имени файла — от А до Я"},
+    {SortField::Name, true, "По имени файла — от Я до А"},
+    {SortField::ModifiedTime, true, "По дате изменения — сначала новые"},
+    {SortField::ModifiedTime, false, "По дате изменения — сначала старые"},
+    {SortField::Size, true, "По размеру — сначала крупные"},
+    {SortField::Size, false, "По размеру — сначала мелкие"},
+};
+
+const SortChoice& sortChoiceFor(SortField field) {
+    for (const SortChoice& choice : kSortChoices) {
+        if (choice.field == field) return choice;
+    }
+    return kSortChoices[0];
+}
+
+const SortChoice* sortChoiceForColumn(int column) {
+    for (const SortChoice& choice : kSortChoices) {
+        if (choice.column == column) return &choice;
+    }
+    return nullptr;
+}
+
+struct TypeFilter {
+    const char* settingsValue;
+    const char* menuText;
+    const char* shortText;   // for the filter chip
+    const char* extensions;  // space-separated, without dots
+};
+const TypeFilter kTypeFilters[] = {
+    {"all", "Все файлы", "", ""},
+    {"documents", "Документы: Word, Excel, PDF, презентации, текст", "документы",
+     "doc docx docm rtf odt xls xlsx xlsm xlsb ods csv pdf ppt pptx pps ppsx odp txt md"},
+    {"word", "Word", "Word", "doc docx docm dot dotx rtf odt"},
+    {"excel", "Excel и CSV", "Excel", "xls xlsx xlsm xlsb ods csv"},
+    {"pdf", "PDF", "PDF", "pdf"},
+    {"presentations", "Презентации", "презентации", "ppt pptx pps ppsx odp"},
+    {"text", "Текстовые файлы", "текст", "txt md log ini cfg conf json xml html htm"},
+    {"images", "Изображения", "изображения", "jpg jpeg png gif bmp tif tiff webp heic svg"},
+    {"archives", "Архивы", "архивы", "zip rar 7z tar gz tgz bz2"},
+};
+
+struct DateFilter {
+    const char* settingsValue;
+    const char* menuText;
+    const char* shortText;
+    int days;  // 0: any time; -1: since midnight
+};
+const DateFilter kDateFilters[] = {
+    {"any", "Когда угодно", "", 0},
+    {"today", "Сегодня", "сегодня", -1},
+    {"7days", "За последние 7 дней", "за 7 дней", 7},
+    {"30days", "За последние 30 дней", "за 30 дней", 30},
+    {"year", "За последний год", "за год", 365},
+};
+
+// Index of the entry whose settingsValue is saved under `key`, 0 if none.
+template <typename Filter, std::size_t N>
+int savedFilter(const char* key, const Filter (&filters)[N]) {
+    const QString saved = QSettings().value(key).toString();
+    for (std::size_t i = 0; i < N; ++i) {
+        if (saved == QLatin1String(filters[i].settingsValue)) return static_cast<int>(i);
+    }
+    return 0;
+}
+
+struct PathElideChoice {
+    Qt::TextElideMode mode;
+    const char* settingsValue;
+    const char* menuText;
+};
+const PathElideChoice kPathElideChoices[] = {
+    {Qt::ElideMiddle, "middle", "Сокращать середину — видны диск и папка файла"},
+    {Qt::ElideLeft, "start", "Сокращать начало — видны папка и имя файла"},
+    {Qt::ElideRight, "end", "Сокращать конец — видно начало пути"},
+    {Qt::ElideNone, "none", "Не сокращать — столбец по ширине самого длинного пути"},
+};
+
+Qt::TextElideMode savedPathElide() {
+    const QString saved = QSettings().value(kSettingsPathElideKey).toString();
+    for (const PathElideChoice& choice : kPathElideChoices) {
+        if (saved == QLatin1String(choice.settingsValue)) return choice.mode;
+    }
+    return Qt::ElideMiddle;
+}
+
+// The path column shortens a path too long for it the way the user chose
+// (the other columns always shorten the end).
+class PathElideDelegate : public QStyledItemDelegate {
+public:
+    PathElideDelegate(const Qt::TextElideMode* mode, QObject* parent) : QStyledItemDelegate(parent), mode_(mode) {}
+
+protected:
+    void initStyleOption(QStyleOptionViewItem* option, const QModelIndex& index) const override {
+        QStyledItemDelegate::initStyleOption(option, index);
+        option->textElideMode = *mode_;
+    }
+
+private:
+    const Qt::TextElideMode* mode_;
+};
 
 // A drive ("D:\", "/") stays as it is; a folder shows by its own name.
 QString shortRootName(const QString& root) {
@@ -249,6 +386,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(monitorAction, &QAction::triggered, this, &MainWindow::showMonitor);
     connect(openIndexFolder, &QAction::triggered, this,
             [] { QDesktopServices::openUrl(QUrl::fromLocalFile(IndexManager::indexDirectory())); });
+    buildFiltersMenu();
 
     try {
         platform_ = datasearch::platform::createPlatformService();
@@ -275,7 +413,16 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     wordFormsCheck_->setToolTip(
         tr("Выключено — ищутся слова точно как введены (без учёта регистра): «Михайлов» не найдёт "
            "«Михайлова».\nВключено — ещё и другие формы слова и слова, начинающиеся так же."));
+    filterChip_ = new QPushButton(central);
+    filterChip_->setToolTip(tr("Показаны только файлы, подходящие под фильтр из меню «Фильтры».\n"
+                               "Нажмите, чтобы сбросить фильтр."));
+    filterChip_->setStyleSheet(QStringLiteral(
+        "QPushButton { background: #dbeafe; color: #1e3a8a; border: 1px solid #93c5fd; border-radius: 10px;"
+        " padding: 2px 10px; }"
+        "QPushButton:hover { background: #bfdbfe; }"));
+    filterChip_->setVisible(false);
     searchLayout->addWidget(searchEdit_, 1);
+    searchLayout->addWidget(filterChip_);
     searchLayout->addWidget(wordFormsCheck_);
     searchLayout->addWidget(indexButton_);
     searchLayout->addWidget(pauseResumeButton_);
@@ -306,6 +453,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     resultsView_->setSelectionMode(QAbstractItemView::SingleSelection);
     resultsView_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     resultsView_->horizontalHeader()->setStretchLastSection(true);
+    // A path too long for its column is shortened as chosen in the menu
+    // (by default in the middle, keeping the drive and the file's folder);
+    // the full path is the tooltip. (Qt only shortens the end of a cell's
+    // text while word wrap is on.)
+    resultsView_->setWordWrap(false);
+    resultsView_->setItemDelegateForColumn(ResultsTableModel::ColumnPath, new PathElideDelegate(&pathElide_, resultsView_));
+    resultsView_->horizontalHeader()->resizeSection(ResultsTableModel::ColumnName, 220);
+    resultsView_->horizontalHeader()->resizeSection(ResultsTableModel::ColumnPath, kPathColumnWidth);
+    resultsView_->horizontalHeader()->resizeSection(ResultsTableModel::ColumnModified, 150);
+    // A click on a column header sorts by it, a second click reverses, a
+    // third goes back to relevance (see onResultsHeaderClicked).
+    resultsView_->horizontalHeader()->setSectionsClickable(true);
+    resultsView_->horizontalHeader()->setSortIndicatorShown(true);
     resultsView_->setContextMenuPolicy(Qt::CustomContextMenu);
     splitter->addWidget(resultsView_);
     splitter->setStretchFactor(1, 1);
@@ -368,6 +528,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(resultsView_, &QTableView::customContextMenuRequested, this,
             &MainWindow::onResultsContextMenuRequested);
     connect(resultsView_, &QTableView::doubleClicked, this, &MainWindow::onResultDoubleClicked);
+    connect(resultsView_->horizontalHeader(), &QHeaderView::sectionClicked, this,
+            &MainWindow::onResultsHeaderClicked);
+    connect(filterChip_, &QPushButton::clicked, this, [this] { setFilters(0, 0); });
+    syncSortAndFiltersUi();
     connect(indexManager_, &IndexManager::watcherActivity, this, &MainWindow::onWatcherActivity);
     connect(indexManager_, &IndexManager::sourceUnavailable, this, &MainWindow::onSourceUnavailable);
     connect(pauseResumeButton_, &QPushButton::clicked, this, &MainWindow::onPauseResumeClicked);
@@ -394,6 +558,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     onExcludeMasksEdited();
 
     populateVolumes();
+    // Ticking a source on or off searches the new set of sources.
+    connect(volumeList_, &QListWidget::itemChanged, &searchDebounce_, qOverload<>(&QTimer::start));
 
     // Reopen sources from a previous session instantly, then reconcile them
     // in the background (ТЗ п.13.1/FR-23) — search works right away below.
@@ -481,6 +647,7 @@ void MainWindow::onSearchTextChanged(const QString&) {
 }
 
 void MainWindow::runSearch() {
+    const quint64 request = ++searchRequest_;
     const QStringList roots = checkedRoots();
     if (roots.isEmpty()) {
         resultsModel_->setRecords({});
@@ -502,6 +669,18 @@ void MainWindow::runSearch() {
     query.withSnippets = false;  // fetched per visible row, see requestVisibleSnippets()
     query.limit = kResultLimit;
     query.offset = 0;
+    query.sortField = sortField_;
+    query.sortOrder = sortDescending_ ? datasearch::core::SortOrder::Descending : datasearch::core::SortOrder::Ascending;
+    query.foldersFirst = foldersFirst_;
+    for (const QString& ext : QString::fromUtf8(kTypeFilters[typeFilter_].extensions).split(' ', Qt::SkipEmptyParts)) {
+        query.extensions.push_back("." + ext.toStdString());
+    }
+    const int days = kDateFilters[dateFilter_].days;
+    if (days < 0) {
+        query.modifiedSince = QDate::currentDate().startOfDay().toSecsSinceEpoch();
+    } else if (days > 0) {
+        query.modifiedSince = QDateTime::currentSecsSinceEpoch() - static_cast<qint64>(days) * 24 * 60 * 60;
+    }
 
     showNotice(tr("Идёт поиск..."));
 
@@ -509,22 +688,21 @@ void MainWindow::runSearch() {
     // character) against a large index can take a while; without this the
     // whole window would freeze until it finished.
     const QString requestText = searchEdit_->text();
-    const QStringList requestRoots = roots;
     const bool requestExact = query.exactWords;
+    const QString filters = activeFiltersText();
     indexManager_->searchAsync(
         query, stdRoots, this,
-        [this, requestText, requestRoots, requestExact](std::vector<datasearch::core::FileRecord> results,
-                                                        std::uint64_t total) {
+        [this, request, requestText, requestExact, filters](std::vector<datasearch::core::FileRecord> results,
+                                                            std::uint64_t total) {
             // The user may have kept typing (or changed the selected
-            // sources or the mode) while this search was running — a newer
-            // runSearch() call already queued a fresher request, so these
-            // results are stale; drop them rather than briefly flashing
-            // outdated data.
-            if (searchEdit_->text() != requestText || checkedRoots() != requestRoots ||
-                wordFormsCheck_->isChecked() == requestExact) {
-                return;
-            }
-            if (total == 0 && requestExact && !requestText.trimmed().isEmpty()) {
+            // sources, the mode, the order or a filter) while this search was
+            // running — a newer runSearch() call already queued a fresher
+            // request, so these results are stale; drop them rather than
+            // briefly flashing outdated data.
+            if (request != searchRequest_) return;
+            if (total == 0 && !filters.isEmpty()) {
+                showNotice(tr("Ничего не найдено с фильтром: %1").arg(filters));
+            } else if (total == 0 && requestExact && !requestText.trimmed().isEmpty()) {
                 showNotice(tr("Ничего не найдено: ищутся слова целиком, как введены. "
                               "Для форм слов и начала слова включите «С формами слов»"));
             } else if (total > results.size()) {
@@ -538,6 +716,7 @@ void MainWindow::runSearch() {
             shownExact_ = requestExact;
             snippetRequested_.assign(results.size(), false);
             resultsModel_->setRecords(std::move(results));
+            fitPathColumn();
             requestVisibleSnippets();
         });
 }
@@ -803,6 +982,172 @@ void MainWindow::showMonitor() {
     monitor_->show();
     monitor_->raise();
     monitor_->activateWindow();
+}
+
+void MainWindow::buildFiltersMenu() {
+    // Everything chosen here is remembered between sessions; an active
+    // filter always shows as the chip next to the search box.
+    QSettings settings;
+    const QString savedSort = settings.value(kSettingsSortKey).toString();
+    for (const SortChoice& choice : kSortChoices) {
+        if (savedSort == QLatin1String(choice.settingsValue)) {
+            sortField_ = choice.field;
+            sortDescending_ = settings.value(kSettingsSortDescendingKey, choice.descendingFirst).toBool();
+        }
+    }
+    foldersFirst_ = settings.value(kSettingsFoldersFirstKey, true).toBool();
+    typeFilter_ = savedFilter(kSettingsTypeFilterKey, kTypeFilters);
+    dateFilter_ = savedFilter(kSettingsDateFilterKey, kDateFilters);
+
+    QMenu* menu = menuBar()->addMenu(tr("Фильтры"));
+    QMenu* sortMenu = menu->addMenu(tr("Сортировка"));
+    auto* sortGroup = new QActionGroup(sortMenu);
+    for (std::size_t i = 0; i < std::size(kSortMenu); ++i) {
+        const SortMenuItem& item = kSortMenu[i];
+        if (i > 0 && kSortMenu[i - 1].field != item.field) sortMenu->addSeparator();
+        QAction* action = sortMenu->addAction(QString::fromUtf8(item.text));
+        action->setCheckable(true);
+        action->setMenuRole(QAction::NoRole);
+        sortGroup->addAction(action);
+        sortActions_.push_back(action);
+        connect(action, &QAction::triggered, this, [this, &item] { setSort(item.field, item.descending); });
+    }
+    sortMenu->addSeparator();
+    QAction* foldersFirst = sortMenu->addAction(tr("Папки перед файлами, как в Проводнике"));
+    foldersFirst->setCheckable(true);
+    foldersFirst->setChecked(foldersFirst_);
+    foldersFirst->setMenuRole(QAction::NoRole);
+    sortMenu->setToolTipsVisible(true);
+    foldersFirst->setToolTip(tr("При сортировке по папкам: в каждой папке сначала её подпапки, потом её файлы.\n"
+                                "Если выключить — сначала файлы папки, потом подпапки."));
+    connect(foldersFirst, &QAction::toggled, this, [this](bool on) {
+        foldersFirst_ = on;
+        QSettings().setValue(kSettingsFoldersFirstKey, on);
+        runSearch();
+    });
+
+    QMenu* typeMenu = menu->addMenu(tr("Тип файлов"));
+    auto* typeGroup = new QActionGroup(typeMenu);
+    for (int i = 0; i < static_cast<int>(std::size(kTypeFilters)); ++i) {
+        QAction* action = typeMenu->addAction(QString::fromUtf8(kTypeFilters[i].menuText));
+        action->setCheckable(true);
+        action->setMenuRole(QAction::NoRole);
+        typeGroup->addAction(action);
+        typeActions_.push_back(action);
+        connect(action, &QAction::triggered, this, [this, i] { setFilters(i, dateFilter_); });
+        if (i == 0) typeMenu->addSeparator();
+    }
+
+    QMenu* dateMenu = menu->addMenu(tr("Дата изменения"));
+    auto* dateGroup = new QActionGroup(dateMenu);
+    for (int i = 0; i < static_cast<int>(std::size(kDateFilters)); ++i) {
+        QAction* action = dateMenu->addAction(QString::fromUtf8(kDateFilters[i].menuText));
+        action->setCheckable(true);
+        action->setMenuRole(QAction::NoRole);
+        dateGroup->addAction(action);
+        dateActions_.push_back(action);
+        connect(action, &QAction::triggered, this, [this, i] { setFilters(typeFilter_, i); });
+        if (i == 0) dateMenu->addSeparator();
+    }
+
+    QMenu* pathMenu = menu->addMenu(tr("Длинный путь в таблице"));
+    auto* pathGroup = new QActionGroup(pathMenu);
+    pathElide_ = savedPathElide();
+    for (const PathElideChoice& choice : kPathElideChoices) {
+        QAction* action = pathMenu->addAction(QString::fromUtf8(choice.menuText));
+        action->setCheckable(true);
+        action->setChecked(choice.mode == pathElide_);
+        action->setMenuRole(QAction::NoRole);
+        pathGroup->addAction(action);
+        connect(action, &QAction::triggered, this, [this, &choice] {
+            setPathElide(choice.mode);
+            QSettings().setValue(kSettingsPathElideKey, QLatin1String(choice.settingsValue));
+        });
+    }
+
+    menu->addSeparator();
+    resetFiltersAction_ = menu->addAction(tr("Сбросить фильтры"));
+    resetFiltersAction_->setMenuRole(QAction::NoRole);
+    connect(resetFiltersAction_, &QAction::triggered, this, [this] { setFilters(0, 0); });
+}
+
+void MainWindow::setSort(SortField field, bool descending) {
+    sortField_ = field;
+    sortDescending_ = descending;
+    const SortChoice& choice = sortChoiceFor(field);
+    QSettings settings;
+    settings.setValue(kSettingsSortKey, QLatin1String(choice.settingsValue));
+    settings.setValue(kSettingsSortDescendingKey, descending);
+    syncSortAndFiltersUi();
+    runSearch();
+}
+
+void MainWindow::setFilters(int typeFilter, int dateFilter) {
+    typeFilter_ = typeFilter;
+    dateFilter_ = dateFilter;
+    QSettings settings;
+    settings.setValue(kSettingsTypeFilterKey, QLatin1String(kTypeFilters[typeFilter].settingsValue));
+    settings.setValue(kSettingsDateFilterKey, QLatin1String(kDateFilters[dateFilter].settingsValue));
+    syncSortAndFiltersUi();
+    runSearch();
+}
+
+void MainWindow::setPathElide(Qt::TextElideMode mode) {
+    const bool wasFull = pathElide_ == Qt::ElideNone;
+    pathElide_ = mode;
+    if (mode == Qt::ElideNone) {
+        fitPathColumn();
+    } else if (wasFull) {
+        resultsView_->horizontalHeader()->resizeSection(ResultsTableModel::ColumnPath, kPathColumnWidth);
+    }
+    resultsView_->viewport()->update();
+}
+
+void MainWindow::fitPathColumn() {
+    // Wide enough for the longest path shown; the table scrolls sideways.
+    if (pathElide_ == Qt::ElideNone && resultsModel_->rowCount() > 0) {
+        resultsView_->resizeColumnToContents(ResultsTableModel::ColumnPath);
+    }
+}
+
+void MainWindow::onResultsHeaderClicked(int column) {
+    const SortChoice* choice = sortChoiceForColumn(column);
+    if (choice == nullptr) {
+        syncSortAndFiltersUi();  // not a sortable column: undo the header's own arrow flip
+    } else if (choice->field != sortField_) {
+        setSort(choice->field, choice->descendingFirst);
+    } else if (sortDescending_ == choice->descendingFirst) {
+        setSort(choice->field, !sortDescending_);
+    } else {
+        setSort(SortField::Relevance, false);
+    }
+}
+
+void MainWindow::syncSortAndFiltersUi() {
+    const SortChoice& choice = sortChoiceFor(sortField_);
+    for (std::size_t i = 0; i < sortActions_.size(); ++i) {
+        sortActions_[i]->setChecked(kSortMenu[i].field == sortField_ &&
+                                    (sortField_ == SortField::Relevance || kSortMenu[i].descending == sortDescending_));
+    }
+    for (std::size_t i = 0; i < typeActions_.size(); ++i) typeActions_[i]->setChecked(static_cast<int>(i) == typeFilter_);
+    for (std::size_t i = 0; i < dateActions_.size(); ++i) dateActions_[i]->setChecked(static_cast<int>(i) == dateFilter_);
+
+    // Qt's arrow points up for "ascending"; for size and date the natural
+    // first click (largest / newest on top) is descending.
+    resultsView_->horizontalHeader()->setSortIndicator(
+        choice.column, sortDescending_ ? Qt::DescendingOrder : Qt::AscendingOrder);
+
+    const QString filters = activeFiltersText();
+    filterChip_->setText(tr("Фильтр: %1  ✕").arg(filters));
+    filterChip_->setVisible(!filters.isEmpty());
+    if (resetFiltersAction_ != nullptr) resetFiltersAction_->setEnabled(!filters.isEmpty());
+}
+
+QString MainWindow::activeFiltersText() const {
+    QStringList parts;
+    if (typeFilter_ > 0) parts << QString::fromUtf8(kTypeFilters[typeFilter_].shortText);
+    if (dateFilter_ > 0) parts << QString::fromUtf8(kDateFilters[dateFilter_].shortText);
+    return parts.join(QStringLiteral(" · "));
 }
 
 void MainWindow::onAddFolderClicked() {

@@ -62,9 +62,12 @@ QVariant ResultsTableModel::data(const QModelIndex& index, int role) const {
         static_cast<std::size_t>(index.row()) >= records_.size()) {
         return {};
     }
+    const FileRecord& record = records_[static_cast<std::size_t>(index.row())];
+    if (role == Qt::ToolTipRole && (index.column() == ColumnName || index.column() == ColumnPath)) {
+        return QString::fromStdString(record.path);
+    }
     if (role != Qt::DisplayRole) return {};
 
-    const FileRecord& record = records_[static_cast<std::size_t>(index.row())];
     switch (index.column()) {
         case ColumnName: return QString::fromStdString(record.name);
         case ColumnPath: return QString::fromStdString(record.path);
@@ -76,6 +79,10 @@ QVariant ResultsTableModel::data(const QModelIndex& index, int role) const {
 }
 
 QVariant ResultsTableModel::headerData(int section, Qt::Orientation orientation, int role) const {
+    if (orientation == Qt::Horizontal && role == Qt::ToolTipRole && section != ColumnSnippet) {
+        return QObject::tr("Щелчок — сортировать по этому столбцу, ещё щелчок — в обратном порядке,\n"
+                           "третий — снова по релевантности. То же в меню «Фильтры» → «Сортировка».");
+    }
     if (orientation != Qt::Horizontal || role != Qt::DisplayRole) {
         return QAbstractTableModel::headerData(section, orientation, role);
     }
