@@ -51,13 +51,20 @@ std::int64_t toEpochSeconds(std::filesystem::file_time_type ftime) {
     using namespace std::chrono;
     // Avoid file_clock::to_sys(): at least one MSVC preview toolset (used by
     // GitHub Actions' windows-latest runner as of writing) fails to compile
-    // it, complaining that to_sys isn't a member of the internal clock type
-    // file_clock aliases to. Converting via a now()/now() offset instead only
-    // relies on basic time_point arithmetic, which every standard clock
-    // supports regardless of whether it also defines to_sys/from_sys.
-    const auto sctp = time_point_cast<system_clock::duration>(
-        ftime - std::filesystem::file_time_type::clock::now() + system_clock::now());
-    return static_cast<std::int64_t>(duration_cast<seconds>(sctp.time_since_epoch()).count());
+    // it. The file clock's epoch is a whole number of seconds away from the
+    // system clock's (1601 vs 1970 on Windows, none on macOS), so it's
+    // measured once from the two now()s and rounded to that whole second.
+    // Converting through the two now()s on every call instead was off by
+    // the moment between them, which the compiler may take in either order:
+    // a file whose time is a whole second (common on exFAT and FAT) came out
+    // a second earlier on some runs, looked modified, and was read again.
+    static const std::int64_t epochOffset = [] {
+        const auto system = duration_cast<microseconds>(system_clock::now().time_since_epoch());
+        const auto file =
+            duration_cast<microseconds>(std::filesystem::file_time_type::clock::now().time_since_epoch());
+        return static_cast<std::int64_t>(round<seconds>(system - file).count());
+    }();
+    return static_cast<std::int64_t>(floor<seconds>(ftime.time_since_epoch()).count()) + epochOffset;
 }
 
 } // namespace

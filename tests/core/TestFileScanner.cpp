@@ -2,6 +2,7 @@
 
 #include "datasearch/core/FileScanner.h"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -77,6 +78,38 @@ void runFileScannerTests() {
     DS_CHECK(stat.has_value());
     DS_CHECK_EQ(stat->name, std::string("alpha.txt"));
     DS_CHECK_EQ(stat->size, std::uint64_t{5});
+
+    // A modification time on a whole second (common on exFAT/FAT disks)
+    // converts to the same value every time and in both the walk and
+    // statFile — a second off on some runs made the startup check read such
+    // files again as "modified". Half a second later is the same second.
+    {
+        using namespace std::chrono;
+        const auto whole = time_point_cast<seconds>(std::filesystem::file_time_type::clock::now() - hours(24));
+        std::filesystem::last_write_time(root / "alpha.txt", std::filesystem::file_time_type(whole));
+        const std::int64_t first = FileScanner::statFile(root / "alpha.txt", options)->modifiedTime;
+        const std::int64_t now = duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+        DS_CHECK(first > now - 24 * 3600 - 5 && first < now - 24 * 3600 + 5);
+        for (int i = 0; i < 20000; ++i) {
+            if (FileScanner::statFile(root / "alpha.txt", options)->modifiedTime != first) {
+                DS_CHECK(false && "whole-second mtime converted inconsistently");
+            }
+        }
+        std::int64_t walked = 0;
+        FileScanner::scan(root, options, [&](const FileRecord& r) {
+            if (r.name == "alpha.txt") walked = r.modifiedTime;
+        });
+        DS_CHECK_EQ(walked, first);
+
+        std::filesystem::last_write_time(root / "alpha.txt",
+                                         std::filesystem::file_time_type(whole) + milliseconds(500));
+        DS_CHECK_EQ(FileScanner::statFile(root / "alpha.txt", options)->modifiedTime, first);
+        std::filesystem::last_write_time(root / "alpha.txt", std::filesystem::file_time_type(whole) + seconds(1));
+        DS_CHECK_EQ(FileScanner::statFile(root / "alpha.txt", options)->modifiedTime, first + 1);
+        std::filesystem::last_write_time(root / "alpha.txt",
+                                         std::filesystem::file_time_type(whole) - milliseconds(1));
+        DS_CHECK_EQ(FileScanner::statFile(root / "alpha.txt", options)->modifiedTime, first - 1);
+    }
 
     DS_CHECK(!FileScanner::statFile(root / "does_not_exist.txt", options).has_value());
     DS_CHECK(!FileScanner::statFile(root / "skip.tmp", options).has_value());  // excluded by mask
