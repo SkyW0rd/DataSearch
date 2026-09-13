@@ -59,6 +59,8 @@ struct IndexerStatus {
     // Their contents are unknown this run; a reconcile pass leaves whatever
     // was indexed inside them untouched rather than treating it as deleted.
     std::uint64_t unreadableDirs = 0;
+    // Threads reading and parsing files at once in this run.
+    std::size_t extractionThreads = 0;
 
     // Heavy files (IndexerOptions::heavyFileThreshold) are set aside during
     // the main pass and processed one at a time at the end.
@@ -237,6 +239,7 @@ private:
     std::atomic<std::uint64_t> filesWritten_{0};
     std::atomic<std::uint64_t> filesFailed_{0};
     std::atomic<std::uint64_t> unreadableDirs_{0};
+    std::atomic<std::size_t> extractionThreads_{0};
     std::atomic<std::size_t> activeWorkers_{0};
     std::atomic<std::size_t> parkedWorkers_{0};
     std::atomic<std::uint64_t> heavyFound_{0};

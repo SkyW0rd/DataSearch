@@ -85,6 +85,7 @@ void Indexer::launch(std::vector<std::filesystem::path> roots, ProgressCallback 
     filesWritten_.store(0);
     filesFailed_.store(0);
     unreadableDirs_.store(0);
+    extractionThreads_.store(0);
     activeWorkers_.store(0);
     parkedWorkers_.store(0);
     heavyFound_.store(0);
@@ -216,6 +217,7 @@ IndexerStatus Indexer::status() const {
     s.filesWritten = filesWritten_.load();
     s.filesFailed = filesFailed_.load();
     s.unreadableDirs = unreadableDirs_.load();
+    s.extractionThreads = extractionThreads_.load();
     s.heavyFound = heavyFound_.load();
     s.heavyDone = heavyDone_.load();
     s.heavyBytesTotal = heavyBytesTotal_.load();
@@ -603,6 +605,7 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
 
     const std::size_t extractorCount =
         indexerOptions_.extractionThreads == 0 ? defaultExtractionThreads() : indexerOptions_.extractionThreads;
+    extractionThreads_.store(extractorCount);
     std::thread writerThread(writer);
     std::vector<std::thread> extractors;
     extractors.reserve(extractorCount);
@@ -689,6 +692,7 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
 
     const auto saveStarted = Clock::now();
     storage_.commitBatch();
+    storage_.checkpoint();
     savingNs_ += nanosSince(saveStarted);
 
     const bool wasCancelled = cancelled_.load(std::memory_order_relaxed);
