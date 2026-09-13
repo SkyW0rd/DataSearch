@@ -24,19 +24,23 @@ struct ScanOptions {
 };
 
 using FileVisitor = std::function<void(const FileRecord&)>;
+using DirectoryVisitor = std::function<void(const std::filesystem::path&)>;
 
 class FileScanner {
 public:
-    // Recursively walks `root`, invoking `visitor` once per regular file.
-    // Symlinks are not followed (avoids cycles). Entries that raise a
-    // filesystem error (permission denied, broken reparse point, ...) are
-    // skipped rather than aborting the whole scan.
+    // Recursively walks `root`, invoking `visitor` once per regular file:
+    // a directory's files first, then its subdirectories, depth-first.
+    // Symlinks (and, on Windows, junctions) are not followed — avoids cycles.
+    // A directory that can't be read — no permission, path too long, removed
+    // mid-walk, I/O error — or whose listing breaks off partway is reported
+    // to `onUnreadableDirectory` and skipped; the rest of the walk carries on.
     // `cancelled`, if non-null, is polled between entries so a caller can
     // stop a long-running scan early.
     static void scan(const std::filesystem::path& root,
                       const ScanOptions& options,
                       const FileVisitor& visitor,
-                      const std::atomic<bool>* cancelled = nullptr);
+                      const std::atomic<bool>* cancelled = nullptr,
+                      const DirectoryVisitor& onUnreadableDirectory = {});
 
     // Metadata for exactly one file, without walking the rest of the tree —
     // used to apply a single live filesystem-change event (ТЗ FR-6/п.13.2)

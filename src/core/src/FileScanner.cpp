@@ -62,78 +62,102 @@ std::int64_t toEpochSeconds(std::filesystem::file_time_type ftime) {
 
 } // namespace
 
+// An explicit stack of directories rather than recursive_directory_iterator:
+// that iterator ends the *entire* walk at the first error it can't skip (a
+// path over the OS limit, a directory deleted mid-walk, a sharing
+// violation). Everything after that point silently went unseen — files never
+// got indexed, and a reconcile pass then dropped indexed files it hadn't
+// reached as "deleted". With transient errors the cut-off moved from run to
+// run, so tens of thousands of files were removed and re-added every start.
 void FileScanner::scan(const std::filesystem::path& root,
                         const ScanOptions& options,
                         const FileVisitor& visitor,
-                        const std::atomic<bool>* cancelled) {
-    std::error_code ec;
-    std::filesystem::recursive_directory_iterator it(
-        root, std::filesystem::directory_options::skip_permission_denied, ec);
-    const std::filesystem::recursive_directory_iterator end;
+                        const std::atomic<bool>* cancelled,
+                        const DirectoryVisitor& onUnreadableDirectory) {
+    auto isCancelled = [cancelled] { return cancelled != nullptr && cancelled->load(std::memory_order_relaxed); };
+    auto reportUnreadable = [&](const std::filesystem::path& dir) {
+        if (onUnreadableDirectory) onUnreadableDirectory(dir);
+    };
 
-    for (; it != end; it.increment(ec)) {
-        if (cancelled != nullptr && cancelled->load(std::memory_order_relaxed)) {
-            return;
-        }
-        if (ec) {
-            // Skip the entry that raised the error and keep going.
-            ec.clear();
+    std::vector<std::filesystem::path> pending{root};
+    while (!pending.empty()) {
+        if (isCancelled()) return;
+        const std::filesystem::path dir = std::move(pending.back());
+        pending.pop_back();
+
+        std::error_code iterEc;
+        // No skip_permission_denied: a folder we may not read is as unknown
+        // as one that failed any other way, and must be reported so a
+        // reconcile pass keeps (rather than drops) what was indexed in it.
+        std::filesystem::directory_iterator it(dir, iterEc);
+        if (iterEc) {
+            reportUnreadable(dir);
             continue;
         }
 
-        const std::filesystem::directory_entry& entry = *it;
-        const std::string name = pathToUtf8(entry.path().filename());
+        std::vector<std::filesystem::path> subdirs;
+        const std::filesystem::directory_iterator end;
+        for (; it != end; it.increment(iterEc)) {
+            if (isCancelled()) return;
 
-        if (entry.is_symlink(ec)) {
-            it.disable_recursion_pending();
-            continue;
-        }
-
-        bool isDir = entry.is_directory(ec);
-        if (ec) {
-            ec.clear();
-            continue;
-        }
-
-        if (isDir) {
-            if (matchesAnyMask(options.excludeMasks, name)) {
-                it.disable_recursion_pending();
+            const std::filesystem::directory_entry& entry = *it;
+            // An entry that can't even be stat'ed (e.g. its path exceeds the OS
+            // limit) may well be a directory; report it rather than let
+            // whatever it holds look deleted.
+            std::error_code ec;
+            const auto linkType = entry.symlink_status(ec).type();
+            if (ec) {
+                reportUnreadable(entry.path());
+                continue;
             }
-            continue;
+            bool isLink = linkType == std::filesystem::file_type::symlink;
+#if defined(_MSC_VER)
+            isLink = isLink || linkType == std::filesystem::file_type::junction;
+#endif
+            if (isLink) continue;
+
+            const std::string name = pathToUtf8(entry.path().filename());
+            const bool isDir = entry.is_directory(ec);
+            if (ec) {
+                reportUnreadable(entry.path());
+                continue;
+            }
+            if (isDir) {
+                if (!matchesAnyMask(options.excludeMasks, name)) subdirs.push_back(entry.path());
+                continue;
+            }
+
+            const bool isRegular = entry.is_regular_file(ec);
+            if (ec || !isRegular) continue;
+            if (matchesAnyMask(options.excludeMasks, name)) continue;
+
+            FileRecord record;
+            record.path = pathToUtf8(entry.path());
+            record.name = name;
+            record.extension = pathToUtf8(entry.path().extension());
+
+            record.size = static_cast<std::uint64_t>(entry.file_size(ec));
+            if (ec) {
+                ec.clear();
+                record.size = 0;
+            }
+
+            const auto mtime = entry.last_write_time(ec);
+            if (!ec) {
+                record.modifiedTime = toEpochSeconds(mtime);
+            }
+
+            if (options.creationTimeProvider) {
+                record.createdTime = options.creationTimeProvider(entry.path());
+            }
+
+            visitor(record);
         }
+        // The listing broke off partway: whatever came after is unknown.
+        if (iterEc) reportUnreadable(dir);
 
-        bool isRegular = entry.is_regular_file(ec);
-        if (ec || !isRegular) {
-            ec.clear();
-            continue;
-        }
-
-        if (matchesAnyMask(options.excludeMasks, name)) {
-            continue;
-        }
-
-        FileRecord record;
-        record.path = pathToUtf8(entry.path());
-        record.name = name;
-        record.extension = pathToUtf8(entry.path().extension());
-
-        record.size = static_cast<std::uint64_t>(entry.file_size(ec));
-        if (ec) {
-            ec.clear();
-            record.size = 0;
-        }
-
-        const auto mtime = entry.last_write_time(ec);
-        if (!ec) {
-            record.modifiedTime = toEpochSeconds(mtime);
-        }
-        ec.clear();
-
-        if (options.creationTimeProvider) {
-            record.createdTime = options.creationTimeProvider(entry.path());
-        }
-
-        visitor(record);
+        // Pushed in reverse so they're popped — and walked — in listing order.
+        for (auto sub = subdirs.rbegin(); sub != subdirs.rend(); ++sub) pending.push_back(std::move(*sub));
     }
 }
 
