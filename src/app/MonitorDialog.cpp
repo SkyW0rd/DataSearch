@@ -286,7 +286,7 @@ void MonitorDialog::refresh() {
                                            .arg(formatCount(s.heavyDone), formatCount(s.heavyFound),
                                                 formatSize(s.heavyBytesTotal))
                                      : tr("нет"));
-    problems_->setText(tr("ошибок при обработке файлов: %1, недоступных папок: %2")
+    problems_->setText(tr("не удалось прочитать текст файлов: %1 (ищутся по имени), недоступных папок: %2")
                            .arg(formatCount(s.filesFailed), formatCount(s.unreadableDirs)));
     advice_->setText(adviceFor(t));
 }

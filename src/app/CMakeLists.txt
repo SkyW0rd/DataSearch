@@ -14,6 +14,8 @@ add_executable(datasearch_app WIN32
   IndexManager.cpp
   MonitorDialog.h
   MonitorDialog.cpp
+  ProblemFilesDialog.h
+  ProblemFilesDialog.cpp
   Format.h
 )
 

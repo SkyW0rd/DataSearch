@@ -77,6 +77,7 @@ IndexManager::IndexManager(IPlatformService* platform, QObject* parent)
         }
         startWatch(root);
     });
+    connect(this, &IndexManager::finished, this, &IndexManager::problemFilesChanged);
 
     watcherThread_ = std::thread(&IndexManager::watcherThreadMain, this);
     searchThread_ = std::thread(&IndexManager::searchThreadMain, this);
@@ -470,11 +471,16 @@ void IndexManager::watcherThreadMain() {
             if (storage == nullptr) continue;
 
             for (auto& [path, kind] : changes) {
-                applyChange(*storage, root, path, kind);
+                try {
+                    applyChange(*storage, root, path, kind);
+                } catch (const std::exception&) {
+                    // One file's failure (a SQLite error) mustn't end live updates.
+                }
             }
             emit watcherActivity(QString::fromStdString(root),
                                   tr("Обновлено файлов: %1").arg(changes.size()));
         }
+        emit problemFilesChanged();
     }
 }
 
@@ -502,10 +508,48 @@ void IndexManager::applyChange(IndexStorage& storage, const std::string& root, c
     std::string content;
     std::string ext = record.extension;
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+    auto problem = datasearch::core::ExtractionProblem::None;
+    std::string error;
     if (datasearch::core::ContentExtractor::isSupportedExtension(ext)) {
-        if (auto extracted = datasearch::core::ContentExtractor::extract(fsPath, ext)) {
-            content = std::move(*extracted);
+        try {
+            if (auto extracted = datasearch::core::ContentExtractor::extract(fsPath, ext, {}, nullptr, &problem)) {
+                content = std::move(*extracted);
+            }
+        } catch (const std::exception& e) {
+            content.clear();
+            problem = datasearch::core::ExtractionProblem::Failed;
+            error = e.what();
         }
     }
+    // As during indexing: with or without its text, then listed if unread.
     storage.upsertFile(record, content);
+    if (problem != datasearch::core::ExtractionProblem::None) storage.recordProblem(record, problem, error);
+}
+
+std::vector<IndexManager::ProblemFileEntry> IndexManager::problemFiles() const {
+    std::vector<std::pair<std::string, IndexStorage*>> sources;
+    {
+        std::lock_guard<std::mutex> lock(mapsMutex_);
+        for (const auto& [root, storage] : storages_) sources.emplace_back(root, storage.get());
+    }
+    std::vector<ProblemFileEntry> out;
+    for (const auto& [root, storage] : sources) {
+        try {
+            for (auto& file : storage->problemFiles()) out.push_back({root, std::move(file)});
+        } catch (const std::exception&) {
+            // An index from a newer/older build without the table: nothing to list.
+        }
+    }
+    return out;
+}
+
+void IndexManager::retryProblemFiles(const std::vector<std::pair<std::string, std::string>>& rootsAndPaths) {
+    if (rootsAndPaths.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        for (const auto& [root, path] : rootsAndPaths) {
+            pendingByRoot_[root][path] = static_cast<int>(FileSystemChange::Kind::Modified);
+        }
+    }
+    pendingCv_.notify_one();
 }

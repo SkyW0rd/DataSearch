@@ -27,6 +27,7 @@ class QAction;
 class IndexManager;
 class ResultsTableModel;
 class MonitorDialog;
+class ProblemFilesDialog;
 
 // Главное окно (ТЗ п.7.1): строка поиска, панель выбора дисков, таблица результатов.
 class MainWindow : public QMainWindow {
@@ -51,6 +52,7 @@ private slots:
     void onExcludeMasksEdited();
     void onAddFolderClicked();
     void showMonitor();
+    void showProblemFiles();
     void onResultsHeaderClicked(int column);
 
 private:
@@ -98,6 +100,7 @@ private:
     QPushButton* pauseResumeButton_ = nullptr;
     QPushButton* addFolderButton_ = nullptr;
     QPointer<MonitorDialog> monitor_;  // one at a time; deletes itself on close
+    QPointer<ProblemFilesDialog> problemFiles_;
     QTimer searchDebounce_;
     QCheckBox* wordFormsCheck_ = nullptr;  // off: whole words exactly as typed
     QPushButton* filterChip_ = nullptr;    // shows the active filters; a click clears them

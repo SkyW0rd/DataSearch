@@ -2,6 +2,7 @@
 
 #include "IndexManager.h"
 #include "MonitorDialog.h"
+#include "ProblemFilesDialog.h"
 #include "Format.h"
 #include "ResultsTableModel.h"
 
@@ -269,7 +270,8 @@ QString describeIndexing(const QString& root, const IndexerStatus& s, double fil
     }
     QString failed;
     if (s.filesFailed > 0) {
-        failed = (compact ? QObject::tr(", ошибок: %1") : QObject::tr(", пропущено из-за ошибок: %1"))
+        failed = (compact ? QObject::tr(", текст не прочитан: %1") : QObject::tr(", не удалось прочитать текст: %1 (ищутся по имени; список — "
+                                   "«Настройки» → «Файлы, которые не удалось прочитать»)"))
                      .arg(formatCount(s.filesFailed));
     }
     if (s.unreadableDirs > 0) {
@@ -382,9 +384,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             QSettings().setValue(kSettingsReadThreadsKey, threads);
         });
     }
+    QAction* problemFilesAction = settingsMenu->addAction(tr("Файлы, которые не удалось прочитать…"));
     QAction* openIndexFolder = settingsMenu->addAction(tr("Открыть папку с индексами"));
     // Keep macOS from moving these into the application menu by their wording.
     monitorAction->setMenuRole(QAction::NoRole);
+    problemFilesAction->setMenuRole(QAction::NoRole);
+    connect(problemFilesAction, &QAction::triggered, this, &MainWindow::showProblemFiles);
     openIndexFolder->setMenuRole(QAction::NoRole);
     connect(monitorAction, &QAction::triggered, this, &MainWindow::showMonitor);
     connect(openIndexFolder, &QAction::triggered, this,
@@ -1191,6 +1196,16 @@ QString MainWindow::activeFiltersText() const {
     if (typeFilter_ > 0) parts << QString::fromUtf8(kTypeFilters[typeFilter_].shortText);
     if (dateFilter_ > 0) parts << QString::fromUtf8(kDateFilters[dateFilter_].shortText);
     return parts.join(QStringLiteral(" · "));
+}
+
+void MainWindow::showProblemFiles() {
+    if (!problemFiles_) {
+        problemFiles_ = new ProblemFilesDialog(indexManager_, platform_.get(), this);
+        problemFiles_->setAttribute(Qt::WA_DeleteOnClose);
+    }
+    problemFiles_->show();
+    problemFiles_->raise();
+    problemFiles_->activateWindow();
 }
 
 void MainWindow::onAddFolderClicked() {

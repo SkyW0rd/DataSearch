@@ -117,6 +117,17 @@ public:
     // hard drive, false for an SSD, nullopt if unknown or not checked yet.
     std::optional<bool> diskIsRotational(const std::string& root) const;
 
+    // Files whose text couldn't be read, across every open index — each one
+    // indexed by name only and skipped by startup checks until it changes.
+    struct ProblemFileEntry {
+        std::string root;
+        datasearch::core::ProblemFile file;
+    };
+    std::vector<ProblemFileEntry> problemFiles() const;
+    // Reads these files again (root + path, as listed by problemFiles()) on
+    // the live-update thread; problemFilesChanged() follows once done.
+    void retryProblemFiles(const std::vector<std::pair<std::string, std::string>>& rootsAndPaths);
+
     // Bytes the index of `root` takes on disk (database, write-ahead log).
     static std::uint64_t indexSizeOnDisk(const std::string& root);
     // The folder holding the index databases.
@@ -129,6 +140,10 @@ signals:
     // п.11.4, e.g. a disconnected network drive) — its existing index was
     // left untouched and still serves search results.
     void sourceUnavailable(QString rootLabel);
+    // The list of files that couldn't be read may have changed (an indexing
+    // run or startup check finished, or a batch of changes or retries was
+    // applied). Emitted from any thread.
+    void problemFilesChanged();
 
 signals:
     // Internal: marshals a watcher callback (fires on the watch's own
