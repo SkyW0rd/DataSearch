@@ -4,6 +4,7 @@
 
 #include <QAbstractTableModel>
 
+#include <string>
 #include <vector>
 
 // Backs the results QTableView: Имя | Путь | Размер | Дата изменения | Фрагмент
@@ -17,6 +18,9 @@ public:
 
     void setRecords(std::vector<datasearch::core::FileRecord> records);
     const datasearch::core::FileRecord& recordAt(int row) const;
+    // Fills in one row's excerpt, fetched after the rows themselves (only
+    // for rows on screen). Ignored if `row` no longer holds `path`.
+    void setSnippet(int row, const std::string& path, const std::string& snippet);
 
     int rowCount(const QModelIndex& parent = QModelIndex()) const override;
     int columnCount(const QModelIndex& parent = QModelIndex()) const override;

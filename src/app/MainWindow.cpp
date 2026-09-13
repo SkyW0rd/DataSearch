@@ -13,6 +13,8 @@
 
 #include <QAbstractItemView>
 #include <QAction>
+#include <QCheckBox>
+#include <QScrollBar>
 #include <QClipboard>
 #include <QColor>
 #include <QDir>
@@ -44,6 +46,8 @@ using datasearch::platform::VolumeType;
 
 namespace {
 const char* kSettingsExcludeMasksKey = "excludeMasks";
+const char* kSettingsWordFormsKey = "searchWordForms";
+constexpr int kResultLimit = 2000;
 const char* kDefaultExcludeMasks = "*.tmp, node_modules, .git";
 constexpr int kFileNameWidth = 480;
 constexpr int kNoticeWidth = 320;
@@ -92,11 +96,36 @@ QString formatDuration(qint64 seconds) {
 // One source's indexing state in plain words — every stage the backend goes
 // through, so a long step (counting a big disk, a huge file, a pause waiting
 // for the file in flight) reads as work in progress rather than a hang.
+// Seconds until this source is done, or -1 when there's no basis yet. During
+// the main pass only ordinary files count — the heavy ones wait for the end
+// and don't move at the files/s rate; their own forecast takes over once
+// they start (see IndexerStatus::heavySecondsLeft).
+double secondsLeft(const IndexerStatus& s, double filesPerSecond) {
+    if (s.phase == IndexPhase::Upgrading) {
+        return filesPerSecond >= 1 && s.filesTotal > s.filesVisited
+                   ? static_cast<double>(s.filesTotal - s.filesVisited) / filesPerSecond
+                   : -1;
+    }
+    if (s.phase != IndexPhase::Indexing) return -1;
+    if (s.processingHeavy) return s.heavySecondsLeft;
+    if (filesPerSecond < 1) return -1;
+    const quint64 heavyLeft = s.heavyFound - std::min(s.heavyDone, s.heavyFound);
+    const quint64 notDone = s.filesTotal - std::min(s.filesVisited, s.filesTotal);
+    const quint64 normalLeft = notDone - std::min(heavyLeft, notDone);
+    return static_cast<double>(normalLeft) / filesPerSecond;
+}
+
+// 42 s -> "00:42", 1 h 5 min -> "1:05:00".
+QString formatClock(qint64 seconds) {
+    const qint64 h = seconds / 3600;
+    const qint64 m = (seconds % 3600) / 60;
+    const qint64 sec = seconds % 60;
+    return h > 0 ? QString("%1:%2:%3").arg(h).arg(m, 2, 10, QChar('0')).arg(sec, 2, 10, QChar('0'))
+                 : QString("%1:%2").arg(m, 2, 10, QChar('0')).arg(sec, 2, 10, QChar('0'));
+}
+
 // `compact`: folder and file names only, to fit the one-line status bar;
 // otherwise full paths, for its tooltip.
-QString etaText(qint64 secondsLeft) {
-    return QObject::tr("осталось ~%1").arg(formatDuration(secondsLeft));
-}
 
 QString describeIndexing(const QString& root, const IndexerStatus& s, double filesPerSecond,
                          const QFontMetrics& fm, bool compact) {
@@ -111,14 +140,7 @@ QString describeIndexing(const QString& root, const IndexerStatus& s, double fil
         file = fm.elidedText(QDir::toNativeSeparators(QDir(root).relativeFilePath(file)), Qt::ElideMiddle,
                              kFileNameWidth);
     }
-    if (!file.isEmpty()) {
-        QString details = formatSize(s.currentSize);
-        const qint64 onFile =
-            s.currentInProgress ? duration_cast<seconds>(std::chrono::steady_clock::now() - s.currentStartedAt).count()
-                                : 0;
-        if (onFile >= 1) details += QStringLiteral(", ") + formatDuration(onFile);
-        file = QObject::tr("%1 (%2)").arg(file, details);
-    }
+    if (!file.isEmpty()) file = QObject::tr("%1 (%2)").arg(file, formatSize(s.currentSize));
 
     const QString total = (s.totalIsEstimate ? QStringLiteral("~") : QString()) + formatCount(s.filesTotal);
     QString progress;
@@ -135,10 +157,19 @@ QString describeIndexing(const QString& root, const IndexerStatus& s, double fil
         failed = (compact ? QObject::tr(", ошибок: %1") : QObject::tr(", пропущено из-за ошибок: %1"))
                      .arg(formatCount(s.filesFailed));
     }
+    if (s.unreadableDirs > 0) {
+        failed += (compact ? QObject::tr(", недоступных папок: %1")
+                           : QObject::tr(", папок без доступа или с ошибкой чтения: %1"))
+                      .arg(formatCount(s.unreadableDirs));
+    }
 
     switch (s.phase) {
         case IndexPhase::Idle:
             return {};
+        case IndexPhase::Upgrading:
+            if (s.paused) return QObject::tr("%1: на паузе (обновление индекса для точного поиска)").arg(name);
+            return QObject::tr("%1: обновление индекса для точного поиска — файлы не перечитываются")
+                .arg(name);
         case IndexPhase::Counting:
             if (s.cancelRequested) return QObject::tr("%1: остановка…").arg(name);
             if (s.paused) return QObject::tr("%1: на паузе (подсчёт файлов: %2)").arg(name, formatCount(s.filesTotal));
@@ -172,18 +203,10 @@ QString describeIndexing(const QString& root, const IndexerStatus& s, double fil
                              .arg(formatCount(s.heavyDone), formatCount(s.heavyFound), formatSize(s.heavyBytesDone),
                                   formatSize(s.heavyBytesTotal));
                 if (!file.isEmpty()) parts << file;
-                if (s.heavySecondsLeft >= 1) parts << etaText(static_cast<qint64>(s.heavySecondsLeft + 0.5));
             } else {
                 if (!file.isEmpty()) parts << file;
                 if (filesPerSecond >= 1) {
                     parts << QObject::tr("%1 файлов/с").arg(formatCount(static_cast<quint64>(filesPerSecond + 0.5)));
-                    // Heavy files are waiting for the end and don't move at
-                    // this rate, so they're left out of the estimate.
-                    const quint64 heavyLeft = s.heavyFound - std::min(s.heavyDone, s.heavyFound);
-                    const quint64 notDone = s.filesTotal - std::min(s.filesVisited, s.filesTotal);
-                    const quint64 normalLeft = notDone - std::min(heavyLeft, notDone);
-                    const auto left = static_cast<qint64>(normalLeft / filesPerSecond);
-                    if (left >= 1) parts << etaText(left);
                 }
                 if (s.heavyFound > 0) {
                     parts << QObject::tr("крупные в конце: %1 (%2)")
@@ -238,7 +261,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     searchEdit_->setToolTip(tr("Операторы: \"точная фраза\", -исключить, ext:docx, path:D:\\Work\\"));
     indexButton_ = new QPushButton(tr("Индексировать выбранные"), central);
     pauseResumeButton_ = new QPushButton(tr("Пауза"), central);
+    wordFormsCheck_ = new QCheckBox(tr("С формами слов"), central);
+    wordFormsCheck_->setToolTip(
+        tr("Выключено — ищутся слова точно как введены (без учёта регистра): «Михайлов» не найдёт "
+           "«Михайлова».\nВключено — ещё и другие формы слова и слова, начинающиеся так же."));
     searchLayout->addWidget(searchEdit_, 1);
+    searchLayout->addWidget(wordFormsCheck_);
     searchLayout->addWidget(indexButton_);
     searchLayout->addWidget(pauseResumeButton_);
     rootLayout->addLayout(searchLayout);
@@ -286,6 +314,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     progressBar_ = new QProgressBar(progressRow_);
     progressBar_->setRange(0, 1000);
     progressBar_->setAlignment(Qt::AlignCenter);
+    // Time lives on the bar: elapsed on the left (from zero, pauses not
+    // counted), the estimate of what's left on the right.
+    auto* barLayout = new QHBoxLayout(progressBar_);
+    barLayout->setContentsMargins(10, 0, 10, 0);
+    elapsedLabel_ = new QLabel(progressBar_);
+    etaLabel_ = new QLabel(progressBar_);
+    for (QLabel* label : {elapsedLabel_, etaLabel_}) {
+        label->setStyleSheet(QStringLiteral("background: transparent; font-weight: 600;"));
+        label->setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+    barLayout->addWidget(elapsedLabel_);
+    barLayout->addStretch(1);
+    barLayout->addWidget(etaLabel_);
     progressLayout->addWidget(busyBar_);
     progressLayout->addWidget(progressBar_, 1);
     progressRow_->setVisible(false);
@@ -322,6 +363,18 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(pauseResumeButton_, &QPushButton::clicked, this, &MainWindow::onPauseResumeClicked);
     connect(addFolderButton_, &QPushButton::clicked, this, &MainWindow::onAddFolderClicked);
     connect(excludeMasksEdit_, &QLineEdit::editingFinished, this, &MainWindow::onExcludeMasksEdited);
+    wordFormsCheck_->setChecked(QSettings().value(kSettingsWordFormsKey, false).toBool());
+    connect(wordFormsCheck_, &QCheckBox::toggled, this, [this](bool on) {
+        QSettings().setValue(kSettingsWordFormsKey, on);
+        runSearch();
+    });
+    snippetDebounce_.setSingleShot(true);
+    snippetDebounce_.setInterval(80);
+    connect(&snippetDebounce_, &QTimer::timeout, this, &MainWindow::requestVisibleSnippets);
+    connect(resultsView_->verticalScrollBar(), &QScrollBar::valueChanged, &snippetDebounce_,
+            qOverload<>(&QTimer::start));
+    connect(resultsView_->verticalScrollBar(), &QScrollBar::rangeChanged, &snippetDebounce_,
+            qOverload<>(&QTimer::start));
 
     {
         QSettings settings;
@@ -435,7 +488,9 @@ void MainWindow::runSearch() {
     // default sort — matches Elasticsearch-style ranked results; browsing
     // with an empty query naturally falls back to a plain name-sorted list
     // (see IndexStorage::search).
-    query.limit = 500;
+    query.exactWords = !wordFormsCheck_->isChecked();
+    query.withSnippets = false;  // fetched per visible row, see requestVisibleSnippets()
+    query.limit = kResultLimit;
     query.offset = 0;
 
     showNotice(tr("Идёт поиск..."));
@@ -445,17 +500,65 @@ void MainWindow::runSearch() {
     // whole window would freeze until it finished.
     const QString requestText = searchEdit_->text();
     const QStringList requestRoots = roots;
+    const bool requestExact = query.exactWords;
     indexManager_->searchAsync(
         query, stdRoots, this,
-        [this, requestText, requestRoots](std::vector<datasearch::core::FileRecord> results) {
+        [this, requestText, requestRoots, requestExact](std::vector<datasearch::core::FileRecord> results,
+                                                        std::uint64_t total) {
             // The user may have kept typing (or changed the selected
-            // sources) while this search was running — a newer runSearch()
-            // call already queued a fresher request, so these results are
-            // stale; drop them rather than briefly flashing outdated data.
-            if (searchEdit_->text() != requestText || checkedRoots() != requestRoots) return;
-            showNotice(tr("Найдено файлов: %1").arg(results.size()));
+            // sources or the mode) while this search was running — a newer
+            // runSearch() call already queued a fresher request, so these
+            // results are stale; drop them rather than briefly flashing
+            // outdated data.
+            if (searchEdit_->text() != requestText || checkedRoots() != requestRoots ||
+                wordFormsCheck_->isChecked() == requestExact) {
+                return;
+            }
+            if (total == 0 && requestExact && !requestText.trimmed().isEmpty()) {
+                showNotice(tr("Ничего не найдено: ищутся слова целиком, как введены. "
+                              "Для форм слов и начала слова включите «С формами слов»"));
+            } else if (total > results.size()) {
+                showNotice(tr("Найдено файлов: %1 (показаны первые %2)")
+                               .arg(formatCount(total), formatCount(results.size())));
+            } else {
+                showNotice(tr("Найдено файлов: %1").arg(formatCount(total)));
+            }
+            ++resultsGeneration_;
+            shownPattern_ = requestText;
+            shownExact_ = requestExact;
+            snippetRequested_.assign(results.size(), false);
             resultsModel_->setRecords(std::move(results));
+            requestVisibleSnippets();
         });
+}
+
+void MainWindow::requestVisibleSnippets() {
+    const int rows = resultsModel_->rowCount();
+    if (rows == 0 || shownPattern_.trimmed().isEmpty() || static_cast<int>(snippetRequested_.size()) != rows) return;
+
+    int first = resultsView_->rowAt(0);
+    int last = resultsView_->rowAt(resultsView_->viewport()->height() - 1);
+    if (first < 0) first = 0;
+    if (last < 0) last = rows - 1;
+    last = std::min(rows - 1, last + 5);  // a few below the fold, so scrolling a little finds them ready
+
+    std::vector<std::pair<int, std::string>> wanted;
+    for (int row = first; row <= last; ++row) {
+        if (snippetRequested_[row]) continue;
+        snippetRequested_[row] = true;
+        wanted.emplace_back(row, resultsModel_->recordAt(row).path);
+    }
+    if (wanted.empty()) return;
+
+    SearchQuery query;
+    query.namePattern = shownPattern_.toStdString();
+    query.exactWords = shownExact_;
+    const quint64 generation = resultsGeneration_;
+    indexManager_->snippetsAsync(query, std::move(wanted), this,
+                                 [this, generation](int row, std::string path, std::string snippet) {
+                                     if (generation != resultsGeneration_) return;
+                                     resultsModel_->setSnippet(row, path, snippet);
+                                 });
 }
 
 void MainWindow::onIndexSelectedClicked() {
@@ -498,6 +601,7 @@ void MainWindow::updateIndexingStatus() {
     bool anyFinishing = false;
     quint64 visitedSum = 0;
     quint64 totalSum = 0;
+    double etaSeconds = -1;
 
     for (const auto& entry : statuses) {
         const IndexerStatus& s = entry.status;
@@ -505,8 +609,9 @@ void MainWindow::updateIndexingStatus() {
         // Files/second, smoothed over ~1 s windows. Time spent paused (or
         // waiting for a pause to take effect) is excluded from the rate.
         RateSample& rate = rates_[entry.root];
-        if (s.phase != IndexPhase::Indexing || s.pauseRequested) {
-            if (s.phase != IndexPhase::Indexing) rate.filesPerSecond = 0;
+        const bool counted = s.phase == IndexPhase::Indexing || s.phase == IndexPhase::Upgrading;
+        if (!counted || s.pauseRequested) {
+            if (!counted) rate.filesPerSecond = 0;
             rate.visited = s.filesVisited;
             rate.atMs = nowMs;
         } else if (rate.atMs < 0 || s.filesVisited < rate.visited) {
@@ -520,8 +625,8 @@ void MainWindow::updateIndexingStatus() {
             rate.atMs = nowMs;
         }
 
-        const bool active = s.phase == IndexPhase::Counting || s.phase == IndexPhase::Indexing ||
-                            s.phase == IndexPhase::Finishing;
+        const bool active = s.phase == IndexPhase::Upgrading || s.phase == IndexPhase::Counting ||
+                            s.phase == IndexPhase::Indexing || s.phase == IndexPhase::Finishing;
         const QString root = QString::fromStdString(entry.root);
         if (active) {
             anyActive = true;
@@ -530,6 +635,7 @@ void MainWindow::updateIndexingStatus() {
             fullLines << describeIndexing(root, s, rate.filesPerSecond, fm, false);
             allPaused = allPaused && s.paused;
             anyFinishing = anyFinishing || s.phase == IndexPhase::Finishing;
+            etaSeconds = std::max(etaSeconds, secondsLeft(s, rate.filesPerSecond));
             visitedSum += std::min(s.filesVisited, s.filesTotal);
             totalSum += s.filesTotal;
         } else if (s.phase == IndexPhase::Finished &&
@@ -547,7 +653,16 @@ void MainWindow::updateIndexingStatus() {
     indexStatusLabel_->setToolTip(fullLines.join('\n'));
 
     progressRow_->setVisible(anyActive);
-    if (anyActive) {
+    if (!anyActive) {
+        activeElapsedMs_ = 0;
+        lastElapsedTickMs_ = -1;
+    } else {
+        if (lastElapsedTickMs_ >= 0 && !allPaused) activeElapsedMs_ += nowMs - lastElapsedTickMs_;
+        lastElapsedTickMs_ = nowMs;
+        elapsedLabel_->setText(formatClock(activeElapsedMs_ / 1000));
+        etaLabel_->setText(etaSeconds >= 1 ? tr("осталось ~%1").arg(formatClock(static_cast<qint64>(etaSeconds + 0.5)))
+                                           : QString());
+
         // Range (0,0) makes the style animate the strip; a fixed range freezes it.
         if (allPaused) {
             busyBar_->setRange(0, 1);

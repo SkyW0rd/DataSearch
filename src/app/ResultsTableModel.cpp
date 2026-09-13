@@ -45,6 +45,13 @@ int ResultsTableModel::rowCount(const QModelIndex& parent) const {
     return static_cast<int>(records_.size());
 }
 
+void ResultsTableModel::setSnippet(int row, const std::string& path, const std::string& snippet) {
+    if (row < 0 || row >= static_cast<int>(records_.size()) || records_[row].path != path) return;
+    records_[row].snippet = snippet;
+    const QModelIndex cell = index(row, ColumnSnippet);
+    emit dataChanged(cell, cell, {Qt::DisplayRole});
+}
+
 int ResultsTableModel::columnCount(const QModelIndex& parent) const {
     if (parent.isValid()) return 0;
     return ColumnCount;

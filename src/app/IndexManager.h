@@ -13,6 +13,7 @@
 #include <optional>
 
 #include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -63,20 +64,12 @@ public:
     // including finished ones. Cheap; meant to be polled by a UI timer.
     std::vector<RootStatus> indexingStatus() const;
 
-    // Searches across the indexes for the given roots (only those that have
-    // already been opened via indexRoots/loadKnownSources — others are
-    // silently skipped). Runs on the calling thread — blocks it for however
-    // long the query takes (ТЗ NFR-2 targets ≤300мс, but an unbounded query
-    // like a single-character prefix against a huge index can take far
-    // longer). Prefer searchAsync() from the GUI thread; this synchronous
-    // form exists for tests and for searchAsync's own background thread.
-    std::vector<datasearch::core::FileRecord> search(const datasearch::core::SearchQuery& query,
-                                                       const std::vector<std::string>& roots);
-
-    // Runs the search on a dedicated background thread so the GUI thread is
-    // never blocked (ТЗ NFR-7: "UI отзывчив при любом объёме индекса"),
-    // regardless of how long a particular query takes. `onDone` is delivered
-    // on `context`'s thread via a queued call, and is automatically skipped
+    // Searches the indexes of the given roots (those opened via indexRoots/
+    // loadKnownSources; others are skipped) on a dedicated background thread
+    // so the GUI thread is never blocked (ТЗ NFR-7: "UI отзывчив при любом объёме индекса"),
+    // regardless of how long a particular query takes. `onDone` gets the
+    // (limited) rows and the total number of matches; it is delivered on
+    // `context`'s thread via a queued call, and is automatically skipped
     // (not a dangling-pointer risk) if `context` is destroyed before the
     // search finishes — pass the requesting widget/object as `context`.
     // If a newer searchAsync() call arrives before an older one has started
@@ -84,7 +77,16 @@ public:
     // query's results are ever delivered, exactly what's needed for
     // search-as-you-type.
     void searchAsync(datasearch::core::SearchQuery query, std::vector<std::string> roots, QObject* context,
-                      std::function<void(std::vector<datasearch::core::FileRecord>)> onDone);
+                     std::function<void(std::vector<datasearch::core::FileRecord>, std::uint64_t total)> onDone);
+
+    // Excerpts for the given rows (row index + path), computed one at a
+    // time on the search thread and delivered to `onEach` on `context`'s
+    // thread as each is ready. Searches take priority: a new searchAsync()
+    // drops whatever excerpts are still queued. A request for the same
+    // query adds to the queue (the view scrolled); a different query
+    // replaces it.
+    void snippetsAsync(datasearch::core::SearchQuery query, std::vector<std::pair<int, std::string>> rows,
+                       QObject* context, std::function<void(int row, std::string path, std::string snippet)> onEach);
 
     // Masks applied to all subsequent full scans, reconciliation passes and
     // live-watch updates (ТЗ FR-8). Does not retroactively re-scan already
@@ -136,6 +138,8 @@ private:
     void applyChange(datasearch::core::IndexStorage& storage, const std::string& root,
                       const std::string& pathUtf8, int kindInt);
     void searchThreadMain();
+    // The index a result path belongs to: the longest known root it lies under.
+    datasearch::core::IndexStorage* storageForPath(const std::string& path) const;
 
     datasearch::platform::IPlatformService* platform_ = nullptr;
     std::unique_ptr<datasearch::core::SourceRegistry> registry_;
@@ -166,11 +170,18 @@ private:
         datasearch::core::SearchQuery query;
         std::vector<std::string> roots;
         QObject* context = nullptr;
-        std::function<void(std::vector<datasearch::core::FileRecord>)> onDone;
+        std::function<void(std::vector<datasearch::core::FileRecord>, std::uint64_t)> onDone;
+    };
+    struct SnippetQueue {
+        datasearch::core::SearchQuery query;
+        std::deque<std::pair<int, std::string>> rows;
+        QObject* context = nullptr;
+        std::function<void(int, std::string, std::string)> onEach;
     };
     std::mutex searchMutex_;
     std::condition_variable searchCv_;
     std::optional<PendingSearch> pendingSearch_;
+    SnippetQueue snippets_;
     bool searchStopping_ = false;
     std::thread searchThread_;
 };

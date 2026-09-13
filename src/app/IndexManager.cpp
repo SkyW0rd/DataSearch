@@ -106,30 +106,100 @@ IndexManager::~IndexManager() {
 }
 
 void IndexManager::searchAsync(SearchQuery query, std::vector<std::string> roots, QObject* context,
-                                std::function<void(std::vector<FileRecord>)> onDone) {
+                                std::function<void(std::vector<FileRecord>, std::uint64_t)> onDone) {
     std::lock_guard<std::mutex> lock(searchMutex_);
     pendingSearch_ = PendingSearch{std::move(query), std::move(roots), context, std::move(onDone)};
+    snippets_.rows.clear();  // excerpts for the previous results are moot now
     searchCv_.notify_one();
+}
+
+void IndexManager::snippetsAsync(SearchQuery query, std::vector<std::pair<int, std::string>> rows, QObject* context,
+                                  std::function<void(int, std::string, std::string)> onEach) {
+    std::lock_guard<std::mutex> lock(searchMutex_);
+    const bool sameQuery = snippets_.query.namePattern == query.namePattern &&
+                           snippets_.query.exactWords == query.exactWords && snippets_.context == context;
+    if (!sameQuery) snippets_.rows.clear();
+    snippets_.query = std::move(query);
+    snippets_.context = context;
+    snippets_.onEach = std::move(onEach);
+    for (auto& row : rows) snippets_.rows.push_back(std::move(row));
+    searchCv_.notify_one();
+}
+
+IndexStorage* IndexManager::storageForPath(const std::string& path) const {
+    std::lock_guard<std::mutex> lock(mapsMutex_);
+    IndexStorage* best = nullptr;
+    std::size_t bestLength = 0;
+    for (const auto& [root, storage] : storages_) {
+        if (root.size() >= bestLength && path.compare(0, root.size(), root) == 0) {
+            best = storage.get();
+            bestLength = root.size();
+        }
+    }
+    return best;
 }
 
 void IndexManager::searchThreadMain() {
     while (true) {
-        PendingSearch job;
+        std::optional<PendingSearch> job;
+        std::pair<int, std::string> row;
+        SearchQuery snippetQuery;
+        QObject* snippetContext = nullptr;
+        std::function<void(int, std::string, std::string)> onEach;
         {
             std::unique_lock<std::mutex> lock(searchMutex_);
-            searchCv_.wait(lock, [this] { return searchStopping_ || pendingSearch_.has_value(); });
-            if (searchStopping_ && !pendingSearch_.has_value()) return;
-            job = std::move(*pendingSearch_);
-            pendingSearch_.reset();
+            searchCv_.wait(lock, [this] {
+                return searchStopping_ || pendingSearch_.has_value() || !snippets_.rows.empty();
+            });
+            if (searchStopping_) return;
+            // Searches first: an excerpt is only worth computing for rows of
+            // the latest results, and those rows are exactly what's still
+            // queued once no search is waiting.
+            if (pendingSearch_) {
+                job = std::move(pendingSearch_);
+                pendingSearch_.reset();
+            } else {
+                row = std::move(snippets_.rows.front());
+                snippets_.rows.pop_front();
+                snippetQuery = snippets_.query;
+                snippetContext = snippets_.context;
+                onEach = snippets_.onEach;
+            }
         }
 
-        auto results = search(job.query, job.roots);
+        if (job) {
+            std::vector<FileRecord> results;
+            std::uint64_t total = 0;
+            {
+                std::vector<IndexStorage*> sources;
+                {
+                    std::lock_guard<std::mutex> lock(mapsMutex_);
+                    for (const auto& root : job->roots) {
+                        auto it = storages_.find(root);
+                        if (it != storages_.end()) sources.push_back(it->second.get());
+                    }
+                }
+                if (!sources.empty()) {
+                    SearchEngine engine(sources);
+                    results = engine.search(job->query);
+                    total = engine.countMatches(job->query);
+                }
+            }
+            QMetaObject::invokeMethod(
+                job->context,
+                [onDone = std::move(job->onDone), results = std::move(results), total]() mutable {
+                    onDone(std::move(results), total);
+                },
+                Qt::QueuedConnection);
+            continue;
+        }
 
-        QObject* context = job.context;
-        auto onDone = std::move(job.onDone);
+        std::string snippet;
+        if (IndexStorage* storage = storageForPath(row.second)) snippet = storage->snippet(row.second, snippetQuery);
         QMetaObject::invokeMethod(
-            context, [onDone = std::move(onDone), results = std::move(results)]() mutable {
-                onDone(std::move(results));
+            snippetContext,
+            [onEach = std::move(onEach), row = std::move(row), snippet = std::move(snippet)]() mutable {
+                onEach(row.first, std::move(row.second), std::move(snippet));
             },
             Qt::QueuedConnection);
     }
@@ -288,21 +358,6 @@ std::vector<IndexManager::RootStatus> IndexManager::indexingStatus() const {
     result.reserve(indexers_.size());
     for (const auto& [root, indexer] : indexers_) result.push_back({root, indexer->status()});
     return result;
-}
-
-std::vector<FileRecord> IndexManager::search(const SearchQuery& query, const std::vector<std::string>& roots) {
-    std::vector<IndexStorage*> sources;
-    {
-        std::lock_guard<std::mutex> lock(mapsMutex_);
-        for (const auto& root : roots) {
-            auto it = storages_.find(root);
-            if (it != storages_.end()) sources.push_back(it->second.get());
-        }
-    }
-    if (sources.empty()) return {};
-
-    SearchEngine engine(sources);
-    return engine.search(query);
 }
 
 void IndexManager::startWatch(const std::string& root) {

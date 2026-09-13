@@ -18,6 +18,7 @@ class QListWidget;
 class QTableView;
 class QProgressBar;
 class QLabel;
+class QCheckBox;
 class QPushButton;
 
 class IndexManager;
@@ -35,6 +36,7 @@ private slots:
     void onIndexSelectedClicked();
     void onIndexFinished(const QString& rootLabel, bool cancelled);
     void updateIndexingStatus();
+    void requestVisibleSnippets();
     void onResultsContextMenuRequested(const QPoint& pos);
     void onResultDoubleClicked(const QModelIndex& index);
     void onWatcherActivity(const QString& rootLabel, const QString& description);
@@ -66,18 +68,32 @@ private:
     QWidget* progressRow_ = nullptr;
     QProgressBar* busyBar_ = nullptr;      // animates while indexing is actually working
     QProgressBar* progressBar_ = nullptr;  // share of files done
+    QLabel* elapsedLabel_ = nullptr;       // on the bar, left: time since indexing started
+    QLabel* etaLabel_ = nullptr;           // on the bar, right: estimate of time left
     QLabel* statusLabel_ = nullptr;       // search results and one-off notices
     QLabel* indexStatusLabel_ = nullptr;  // what indexing is doing right now
     QPushButton* indexButton_ = nullptr;
     QPushButton* pauseResumeButton_ = nullptr;
     QPushButton* addFolderButton_ = nullptr;
     QTimer searchDebounce_;
+    QCheckBox* wordFormsCheck_ = nullptr;  // off: whole words exactly as typed
+
+    // Excerpts are fetched only for rows on screen, after the results
+    // themselves (building one re-reads the whole file's text). The
+    // generation ties late-arriving excerpts to the result list they're for.
+    QTimer snippetDebounce_;
+    QString shownPattern_;
+    bool shownExact_ = true;
+    quint64 resultsGeneration_ = 0;
+    std::vector<bool> snippetRequested_;
 
     // Indexing progress is polled rather than pushed per file: the display
     // always reflects the file actually in flight (including one that takes
     // minutes), and a fast scan can't flood the event queue.
     QTimer indexStatusTimer_;
     QElapsedTimer clock_;
+    qint64 activeElapsedMs_ = 0;     // indexing time shown on the bar, pauses excluded
+    qint64 lastElapsedTickMs_ = -1;
     struct RateSample {
         quint64 visited = 0;
         qint64 atMs = -1;
