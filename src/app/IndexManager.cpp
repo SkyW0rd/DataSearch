@@ -213,6 +213,23 @@ std::filesystem::path IndexManager::dbPathFor(const std::string& root) {
     return datasearch::core::pathFromUtf8(dir.filePath("index/" + fileName).toStdString());
 }
 
+std::uint64_t IndexManager::indexSizeOnDisk(const std::string& root) {
+    const std::filesystem::path db = dbPathFor(root);
+    std::uint64_t total = 0;
+    for (const char* suffix : {"", "-wal", "-shm"}) {
+        std::filesystem::path file = db;
+        file += suffix;
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(file, ec);
+        if (!ec) total += size;
+    }
+    return total;
+}
+
+QString IndexManager::indexDirectory() {
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)).filePath("index");
+}
+
 ScanOptions IndexManager::currentScanOptions() const {
     ScanOptions options;
     std::lock_guard<std::mutex> lock(mapsMutex_);

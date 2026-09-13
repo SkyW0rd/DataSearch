@@ -6,6 +6,7 @@
 #include <QMainWindow>
 #include <QModelIndex>
 #include <QPoint>
+#include <QPointer>
 #include <QTimer>
 
 #include <map>
@@ -23,6 +24,7 @@ class QPushButton;
 
 class IndexManager;
 class ResultsTableModel;
+class MonitorDialog;
 
 // Главное окно (ТЗ п.7.1): строка поиска, панель выбора дисков, таблица результатов.
 class MainWindow : public QMainWindow {
@@ -44,6 +46,7 @@ private slots:
     void onPauseResumeClicked();
     void onExcludeMasksEdited();
     void onAddFolderClicked();
+    void showMonitor();
 
 private:
     void populateVolumes();
@@ -75,6 +78,7 @@ private:
     QPushButton* indexButton_ = nullptr;
     QPushButton* pauseResumeButton_ = nullptr;
     QPushButton* addFolderButton_ = nullptr;
+    QPointer<MonitorDialog> monitor_;  // one at a time; deletes itself on close
     QTimer searchDebounce_;
     QCheckBox* wordFormsCheck_ = nullptr;  // off: whole words exactly as typed
 

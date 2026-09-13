@@ -1,6 +1,8 @@
 #include "MainWindow.h"
 
 #include "IndexManager.h"
+#include "MonitorDialog.h"
+#include "Format.h"
 #include "ResultsTableModel.h"
 
 #include "datasearch/core/IndexStorage.h"
@@ -16,6 +18,9 @@
 #include <QCheckBox>
 #include <QScrollBar>
 #include <QClipboard>
+#include <QDesktopServices>
+#include <QMenuBar>
+#include <QUrl>
 #include <QColor>
 #include <QDir>
 #include <QFileDialog>
@@ -40,6 +45,7 @@
 #include <QVBoxLayout>
 
 using datasearch::core::IndexerStatus;
+using namespace display;
 using datasearch::core::IndexPhase;
 using datasearch::core::SearchQuery;
 using datasearch::platform::VolumeType;
@@ -58,22 +64,6 @@ QString shortRootName(const QString& root) {
     return name.isEmpty() ? root : name;
 }
 
-const QLocale& ru() {
-    static const QLocale locale(QLocale::Russian, QLocale::Russia);
-    return locale;
-}
-
-QString formatCount(quint64 n) {
-    return ru().toString(static_cast<qulonglong>(n));
-}
-
-QString formatSize(quint64 bytes) {
-    if (bytes >= 1024ull * 1024 * 1024) return ru().toString(bytes / 1073741824.0, 'f', 1) + QObject::tr(" ГБ");
-    if (bytes >= 1024ull * 1024) return ru().toString(bytes / 1048576.0, 'f', 1) + QObject::tr(" МБ");
-    if (bytes >= 1024) return ru().toString(bytes / 1024.0, 'f', 0) + QObject::tr(" КБ");
-    return ru().toString(static_cast<qulonglong>(bytes)) + QObject::tr(" Б");
-}
-
 // Bar colour by completion, red through orange, green and teal to blue.
 QColor progressColor(double fraction) {
     static const QColor stops[] = {QColor(0xe0, 0x4b, 0x3a), QColor(0xee, 0x8a, 0x2e), QColor(0xb5, 0xc9, 0x3b),
@@ -85,12 +75,6 @@ QColor progressColor(double fraction) {
     auto mix = [t](int a, int b) { return static_cast<int>(a + (b - a) * t + 0.5); };
     return QColor(mix(stops[i].red(), stops[i + 1].red()), mix(stops[i].green(), stops[i + 1].green()),
                   mix(stops[i].blue(), stops[i + 1].blue()));
-}
-
-QString formatDuration(qint64 seconds) {
-    if (seconds < 60) return QObject::tr("%1 с").arg(seconds);
-    if (seconds < 3600) return QObject::tr("%1 мин %2 с").arg(seconds / 60).arg(seconds % 60);
-    return QObject::tr("%1 ч %2 мин").arg(seconds / 3600).arg((seconds % 3600) / 60);
 }
 
 // One source's indexing state in plain words — every stage the backend goes
@@ -113,15 +97,6 @@ double secondsLeft(const IndexerStatus& s, double filesPerSecond) {
     const quint64 notDone = s.filesTotal - std::min(s.filesVisited, s.filesTotal);
     const quint64 normalLeft = notDone - std::min(heavyLeft, notDone);
     return static_cast<double>(normalLeft) / filesPerSecond;
-}
-
-// 42 s -> "00:42", 1 h 5 min -> "1:05:00".
-QString formatClock(qint64 seconds) {
-    const qint64 h = seconds / 3600;
-    const qint64 m = (seconds % 3600) / 60;
-    const qint64 sec = seconds % 60;
-    return h > 0 ? QString("%1:%2:%3").arg(h).arg(m, 2, 10, QChar('0')).arg(sec, 2, 10, QChar('0'))
-                 : QString("%1:%2").arg(m, 2, 10, QChar('0')).arg(sec, 2, 10, QChar('0'));
 }
 
 // `compact`: folder and file names only, to fit the one-line status bar;
@@ -240,6 +215,16 @@ QString describeIndexing(const QString& root, const IndexerStatus& s, double fil
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle(tr("DataSearch"));
+
+    auto* settingsMenu = menuBar()->addMenu(tr("Настройки"));
+    QAction* monitorAction = settingsMenu->addAction(tr("Мониторинг индексации…"));
+    QAction* openIndexFolder = settingsMenu->addAction(tr("Открыть папку с индексами"));
+    // Keep macOS from moving these into the application menu by their wording.
+    monitorAction->setMenuRole(QAction::NoRole);
+    openIndexFolder->setMenuRole(QAction::NoRole);
+    connect(monitorAction, &QAction::triggered, this, &MainWindow::showMonitor);
+    connect(openIndexFolder, &QAction::triggered, this,
+            [] { QDesktopServices::openUrl(QUrl::fromLocalFile(IndexManager::indexDirectory())); });
 
     try {
         platform_ = datasearch::platform::createPlatformService();
@@ -783,6 +768,16 @@ void MainWindow::onPauseResumeClicked() {
         indexManager_->pauseAllIndexing();
     }
     updateIndexingStatus();
+}
+
+void MainWindow::showMonitor() {
+    if (!monitor_) {
+        monitor_ = new MonitorDialog(indexManager_, this);
+        monitor_->setAttribute(Qt::WA_DeleteOnClose);
+    }
+    monitor_->show();
+    monitor_->raise();
+    monitor_->activateWindow();
 }
 
 void MainWindow::onAddFolderClicked() {

@@ -108,6 +108,11 @@ public:
     void resumeAllIndexing();
     bool isAnyIndexingPaused() const;
 
+    // Bytes the index of `root` takes on disk (database, write-ahead log).
+    static std::uint64_t indexSizeOnDisk(const std::string& root);
+    // The folder holding the index databases.
+    static QString indexDirectory();
+
 signals:
     void finished(QString rootLabel, bool cancelled);
     void watcherActivity(QString rootLabel, QString description);

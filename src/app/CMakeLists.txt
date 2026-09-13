@@ -12,6 +12,9 @@ add_executable(datasearch_app WIN32
   ResultsTableModel.cpp
   IndexManager.h
   IndexManager.cpp
+  MonitorDialog.h
+  MonitorDialog.cpp
+  Format.h
 )
 
 target_link_libraries(datasearch_app PRIVATE
