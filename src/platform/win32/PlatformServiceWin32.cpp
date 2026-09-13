@@ -8,6 +8,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winioctl.h>
 
 #include <objbase.h>
 #include <shellapi.h>
@@ -209,6 +210,31 @@ public:
 
     void lowerCurrentThreadPriority() override {
         ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+
+    // The same query Windows itself uses to tell HDDs from SSDs ("seek
+    // penalty"). Opening the volume with no access rights is enough for it,
+    // so no administrator rights are needed.
+    std::optional<bool> isRotationalDisk(const std::filesystem::path& path) override {
+        wchar_t volumePath[MAX_PATH + 1] = {};
+        if (!::GetVolumePathNameW(path.wstring().c_str(), volumePath, MAX_PATH)) return std::nullopt;
+        std::wstring volume = volumePath;  // "E:\"
+        if (volume.size() < 2 || volume[1] != L':') return std::nullopt;  // a share or mount point
+        const std::wstring device = L"\\\\.\\" + volume.substr(0, 2);  // "\\.\E:"
+        HANDLE handle = ::CreateFileW(device.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                      OPEN_EXISTING, 0, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
+
+        STORAGE_PROPERTY_QUERY query{};
+        query.PropertyId = StorageDeviceSeekPenaltyProperty;
+        query.QueryType = PropertyStandardQuery;
+        DEVICE_SEEK_PENALTY_DESCRIPTOR result{};
+        DWORD returned = 0;
+        const BOOL ok = ::DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &result,
+                                          sizeof(result), &returned, nullptr);
+        ::CloseHandle(handle);
+        if (!ok || returned < sizeof(result)) return std::nullopt;
+        return result.IncursSeekPenalty != FALSE;
     }
 };
 

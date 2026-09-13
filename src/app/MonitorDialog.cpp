@@ -119,10 +119,12 @@ MonitorDialog::MonitorDialog(IndexManager* manager, QWidget* parent) : QDialog(p
     files_ = new QLabel(progressBox);
     speed_ = new QLabel(progressBox);
     activeTime_ = new QLabel(progressBox);
+    threads_ = new QLabel(progressBox);
     progressForm->addRow(tr("Этап:"), phase_);
     progressForm->addRow(tr("Файлы:"), files_);
     progressForm->addRow(tr("Скорость:"), speed_);
     progressForm->addRow(tr("Время работы:"), activeTime_);
+    progressForm->addRow(tr("Потоки чтения:"), threads_);
     layout->addWidget(progressBox);
 
     auto* timeBox = new QGroupBox(tr("Куда уходит время (сумма по всем потокам, без пауз)"), this);
@@ -255,6 +257,14 @@ void MonitorDialog::refresh() {
                         .arg(formatCount(static_cast<quint64>(filesPerSecond_ + 0.5)),
                              formatCount(static_cast<quint64>(average + 0.5))));
     activeTime_->setText(formatClock(static_cast<qint64>(s.activeSeconds)));
+    if (s.extractionThreads == 0) {
+        threads_->setText(tr("—"));
+    } else {
+        const auto rotational = manager_->diskIsRotational(entry.root);
+        const QString disk = !rotational ? tr("тип диска не определён") : *rotational ? tr("жёсткий диск") : tr("SSD");
+        const QString how = manager_->readThreads() == 0 ? tr("автоматически") : tr("задано вручную");
+        threads_->setText(tr("%1 (%2, %3)").arg(s.extractionThreads).arg(disk, how));
+    }
 
     const std::array<double, 7> values{t.counting, t.walking, t.reading, t.parsing, t.writing, t.saving, t.upgrading};
     for (std::size_t i = 0; i < stages_.size(); ++i) {

@@ -237,8 +237,24 @@ ScanOptions IndexManager::currentScanOptions() const {
     return options;
 }
 
-IndexerOptions IndexManager::makeIndexerOptions() {
+IndexerOptions IndexManager::makeIndexerOptions(const std::string& root) {
     IndexerOptions options;
+    std::optional<bool> rotational;
+    if (platform_ != nullptr) {
+        try {
+            rotational = platform_->isRotationalDisk(datasearch::core::pathFromUtf8(root));
+        } catch (...) {
+            // Unknown disk type: the default number of threads.
+        }
+    }
+    int threads = 0;
+    {
+        std::lock_guard<std::mutex> lock(mapsMutex_);
+        diskRotational_[root] = rotational;
+        threads = readThreads_;
+    }
+    if (threads == 0 && rotational == true) threads = 1;
+    options.extractionThreads = static_cast<std::size_t>(threads);
     IPlatformService* platform = platform_;
     options.onWorkerThreadStart = [platform]() {
         if (platform == nullptr) return;
@@ -256,6 +272,22 @@ IndexerOptions IndexManager::makeIndexerOptions() {
                               tr("Файл пропущен из-за ошибки: %1").arg(QString::fromStdString(what)));
     };
     return options;
+}
+
+void IndexManager::setReadThreads(int threads) {
+    std::lock_guard<std::mutex> lock(mapsMutex_);
+    readThreads_ = std::clamp(threads, 0, 3);
+}
+
+int IndexManager::readThreads() const {
+    std::lock_guard<std::mutex> lock(mapsMutex_);
+    return readThreads_;
+}
+
+std::optional<bool> IndexManager::diskIsRotational(const std::string& root) const {
+    std::lock_guard<std::mutex> lock(mapsMutex_);
+    const auto it = diskRotational_.find(root);
+    return it == diskRotational_.end() ? std::nullopt : it->second;
 }
 
 void IndexManager::setExcludeMasks(std::vector<std::string> masks) {
@@ -311,7 +343,7 @@ void IndexManager::loadKnownSources() {
             IndexStorage& storage = ensureStorage(entry.root);
 
             auto indexer =
-                std::make_unique<Indexer>(storage, currentScanOptions(), ExtractionOptions{}, makeIndexerOptions());
+                std::make_unique<Indexer>(storage, currentScanOptions(), ExtractionOptions{}, makeIndexerOptions(entry.root));
             Indexer* indexerPtr = indexer.get();
             {
                 std::lock_guard<std::mutex> lock(mapsMutex_);
@@ -352,7 +384,7 @@ std::vector<std::string> IndexManager::indexRoots(const std::vector<std::string>
         try {
             IndexStorage& storage = ensureStorage(root);
             auto indexer =
-                std::make_unique<Indexer>(storage, currentScanOptions(), ExtractionOptions{}, makeIndexerOptions());
+                std::make_unique<Indexer>(storage, currentScanOptions(), ExtractionOptions{}, makeIndexerOptions(root));
             Indexer* indexerPtr = indexer.get();
             {
                 std::lock_guard<std::mutex> lock(mapsMutex_);

@@ -108,6 +108,15 @@ public:
     void resumeAllIndexing();
     bool isAnyIndexingPaused() const;
 
+    // Threads reading files at once: 1-3, or 0 = by disk type (1 on a hard
+    // drive, where parallel reads make the head jump between files; 3
+    // otherwise, ТЗ п.12.3). Takes effect from the next scan that starts.
+    void setReadThreads(int threads);
+    int readThreads() const;
+    // The disk type found for `root` when its last scan started: true for a
+    // hard drive, false for an SSD, nullopt if unknown or not checked yet.
+    std::optional<bool> diskIsRotational(const std::string& root) const;
+
     // Bytes the index of `root` takes on disk (database, write-ahead log).
     static std::uint64_t indexSizeOnDisk(const std::string& root);
     // The folder holding the index databases.
@@ -134,7 +143,7 @@ private:
     static std::filesystem::path dbPathFor(const std::string& root);
 
     datasearch::core::ScanOptions currentScanOptions() const;
-    datasearch::core::IndexerOptions makeIndexerOptions();
+    datasearch::core::IndexerOptions makeIndexerOptions(const std::string& root);
 
     // Opens/creates storage+indexer for `root` if not already present.
     datasearch::core::IndexStorage& ensureStorage(const std::string& root);
@@ -154,6 +163,8 @@ private:
     // from the GUI thread, looked up from the watcher thread).
     mutable std::mutex mapsMutex_;
     std::vector<std::string> excludeMasks_;
+    int readThreads_ = 0;
+    std::map<std::string, std::optional<bool>> diskRotational_;
     std::map<std::string, std::unique_ptr<datasearch::core::IndexStorage>> storages_;
     std::map<std::string, std::unique_ptr<datasearch::core::Indexer>> indexers_;
     std::map<std::string, std::unique_ptr<datasearch::platform::IDirectoryWatch>> watches_;

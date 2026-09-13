@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,13 @@ public:
     // doesn't compete with the user's foreground work for CPU time. Meant to
     // be called once, from inside each indexing worker thread.
     virtual void lowerCurrentThreadPriority() = 0;
+
+    // Whether the disk holding `path` is a spinning hard drive: true for an
+    // HDD, false for an SSD, nullopt when the OS can't tell (a network share,
+    // a volume spanning several disks...). On an HDD several files read at
+    // once make the head jump between them, so indexing reads one at a time
+    // there (ТЗ п.12.3).
+    virtual std::optional<bool> isRotationalDisk(const std::filesystem::path& path) = 0;
 };
 
 // Constructs the platform implementation for the OS this binary was built for.

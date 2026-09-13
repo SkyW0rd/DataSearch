@@ -9,6 +9,8 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreServices/CoreServices.h>
 
+#include <IOKit/IOKitLib.h>
+#include <IOKit/storage/IOStorageDeviceCharacteristics.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <sys/mount.h>
@@ -203,6 +205,40 @@ public:
         // THREAD_PRIORITY_BELOW_NORMAL — background work the user isn't
         // directly waiting on (ТЗ п.12.3).
         pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    }
+
+    // IOKit's "Medium Type" (Solid State / Rotational), searched from the
+    // volume's BSD device up through its providers to the physical drive —
+    // an APFS volume sits on a container that sits on the real disk.
+    std::optional<bool> isRotationalDisk(const std::filesystem::path& path) override {
+        struct statfs fs {};
+        if (statfs(path.c_str(), &fs) != 0) return std::nullopt;
+        const std::string from = fs.f_mntfromname;
+        if (from.rfind("/dev/", 0) != 0) return std::nullopt;  // network or synthetic
+        io_service_t media =
+            IOServiceGetMatchingService(MACH_PORT_NULL, IOBSDNameMatching(MACH_PORT_NULL, 0, from.c_str() + 5));
+        if (media == IO_OBJECT_NULL) return std::nullopt;
+        CFTypeRef characteristics = IORegistryEntrySearchCFProperty(
+            media, kIOServicePlane, CFSTR(kIOPropertyDeviceCharacteristicsKey), kCFAllocatorDefault,
+            kIORegistryIterateRecursively | kIORegistryIterateParents);
+        IOObjectRelease(media);
+        if (characteristics == nullptr) return std::nullopt;
+
+        std::optional<bool> rotational;
+        if (CFGetTypeID(characteristics) == CFDictionaryGetTypeID()) {
+            const auto medium = static_cast<CFStringRef>(CFDictionaryGetValue(
+                static_cast<CFDictionaryRef>(characteristics), CFSTR(kIOPropertyMediumTypeKey)));
+            if (medium != nullptr && CFGetTypeID(medium) == CFStringGetTypeID()) {
+                if (CFStringCompare(medium, CFSTR(kIOPropertyMediumTypeSolidStateKey), 0) == kCFCompareEqualTo) {
+                    rotational = false;
+                } else if (CFStringCompare(medium, CFSTR(kIOPropertyMediumTypeRotationalKey), 0) ==
+                           kCFCompareEqualTo) {
+                    rotational = true;
+                }
+            }
+        }
+        CFRelease(characteristics);
+        return rotational;
     }
 };
 

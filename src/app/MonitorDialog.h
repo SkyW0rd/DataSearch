@@ -31,6 +31,7 @@ private:
     QLabel* files_ = nullptr;
     QLabel* speed_ = nullptr;
     QLabel* activeTime_ = nullptr;
+    QLabel* threads_ = nullptr;
 
     struct StageRow {
         QLabel* name = nullptr;

@@ -22,7 +22,9 @@
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -280,6 +282,21 @@ public:
     std::unique_ptr<IDirectoryWatch> watchDirectory(const std::filesystem::path& root,
                                                       FileSystemChangeCallback onChange) override {
         return std::make_unique<DirectoryWatchLinux>(root, std::move(onChange));
+    }
+
+    // sysfs knows per block device: /sys/dev/block/MAJ:MIN is the partition,
+    // and "rotational" lives on the whole disk — the partition's parent.
+    std::optional<bool> isRotationalDisk(const std::filesystem::path& path) override {
+        struct stat st {};
+        if (::stat(path.c_str(), &st) != 0) return std::nullopt;
+        const std::string dev = "/sys/dev/block/" + std::to_string(major(st.st_dev)) + ":" +
+                                std::to_string(minor(st.st_dev));
+        for (const char* candidate : {"/queue/rotational", "/../queue/rotational"}) {
+            std::ifstream in(dev + candidate);
+            int value = -1;
+            if (in >> value && (value == 0 || value == 1)) return value == 1;
+        }
+        return std::nullopt;
     }
 
     void lowerCurrentThreadPriority() override {

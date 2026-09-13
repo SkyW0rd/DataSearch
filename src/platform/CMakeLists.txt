@@ -12,7 +12,7 @@ elseif(APPLE)
     COMPILE_FLAGS "-fobjc-arc"
   )
   target_link_libraries(datasearch_platform PUBLIC datasearch_core
-    "-framework Cocoa" "-framework CoreServices"
+    "-framework Cocoa" "-framework CoreServices" "-framework IOKit"
   )
 elseif(UNIX)
   add_library(datasearch_platform STATIC

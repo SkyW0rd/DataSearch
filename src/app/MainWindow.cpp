@@ -15,6 +15,7 @@
 
 #include <QAbstractItemView>
 #include <QAction>
+#include <QActionGroup>
 #include <QCheckBox>
 #include <QScrollBar>
 #include <QClipboard>
@@ -53,6 +54,7 @@ using datasearch::platform::VolumeType;
 namespace {
 const char* kSettingsExcludeMasksKey = "excludeMasks";
 const char* kSettingsWordFormsKey = "searchWordForms";
+const char* kSettingsReadThreadsKey = "readThreads";
 constexpr int kResultLimit = 2000;
 const char* kDefaultExcludeMasks = "*.tmp, node_modules, .git";
 constexpr int kFileNameWidth = 480;
@@ -218,6 +220,28 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     auto* settingsMenu = menuBar()->addMenu(tr("Настройки"));
     QAction* monitorAction = settingsMenu->addAction(tr("Мониторинг индексации…"));
+    QMenu* threadsMenu = settingsMenu->addMenu(tr("Потоки чтения"));
+    threadsMenu->setToolTipsVisible(true);
+    auto* threadsGroup = new QActionGroup(threadsMenu);
+    const int savedThreads = QSettings().value(kSettingsReadThreadsKey, 0).toInt();
+    const std::pair<int, QString> threadChoices[] = {
+        {0, tr("Автоматически: 1 для жёсткого диска, 3 для SSD")},
+        {1, tr("1 поток")},
+        {2, tr("2 потока")},
+        {3, tr("3 потока")},
+    };
+    for (const auto& [threads, text] : threadChoices) {
+        QAction* choice = threadsMenu->addAction(text);
+        choice->setCheckable(true);
+        choice->setChecked(threads == savedThreads);
+        choice->setMenuRole(QAction::NoRole);
+        choice->setToolTip(tr("Действует со следующего запуска индексации"));
+        threadsGroup->addAction(choice);
+        connect(choice, &QAction::triggered, this, [this, threads = threads] {
+            indexManager_->setReadThreads(threads);
+            QSettings().setValue(kSettingsReadThreadsKey, threads);
+        });
+    }
     QAction* openIndexFolder = settingsMenu->addAction(tr("Открыть папку с индексами"));
     // Keep macOS from moving these into the application menu by their wording.
     monitorAction->setMenuRole(QAction::NoRole);
@@ -235,6 +259,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     }
 
     indexManager_ = new IndexManager(platform_.get(), this);
+    indexManager_->setReadThreads(QSettings().value(kSettingsReadThreadsKey, 0).toInt());
     resultsModel_ = new ResultsTableModel(this);
 
     auto* central = new QWidget(this);
