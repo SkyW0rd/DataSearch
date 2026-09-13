@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,6 +24,12 @@ std::size_t defaultThreadCount() {
     const unsigned hw = std::thread::hardware_concurrency();
     const std::size_t half = (hw == 0) ? 1 : static_cast<std::size_t>(hw) / 2;
     return std::max<std::size_t>(1, std::min<std::size_t>(4, half));
+}
+
+using Clock = std::chrono::steady_clock;
+
+std::uint64_t nanosSince(Clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 }
 
 struct FileStat {
@@ -79,6 +86,10 @@ void Indexer::launch(std::vector<std::filesystem::path> roots, ProgressCallback 
     heavyActiveMs_.store(0);
     currentWork_.store(0);
     processingHeavy_.store(false);
+    for (auto* counter : {&countingNs_, &walkingNs_, &readingNs_, &parsingNs_, &writingNs_, &savingNs_,
+                          &upgradingNs_, &pausedNs_, &bytesRead_, &textBytes_, &filesWithText_}) {
+        counter->store(0);
+    }
     {
         std::lock_guard<std::mutex> lock(statusMutex_);
         currentPath_.clear();
@@ -126,11 +137,13 @@ bool Indexer::isPaused() const {
 void Indexer::waitWhilePaused() {
     if (!paused_.load(std::memory_order_relaxed)) return;
     std::unique_lock<std::mutex> lock(pauseMutex_);
+    const auto start = Clock::now();
     ++parkedWorkers_;
     pauseCv_.wait(lock, [this] {
         return !paused_.load(std::memory_order_relaxed) || cancelled_.load(std::memory_order_relaxed);
     });
     --parkedWorkers_;
+    pausedNs_ += nanosSince(start);
 }
 
 void Indexer::beginFile(const std::string& path, std::uint64_t size) {
@@ -190,6 +203,17 @@ IndexerStatus Indexer::status() const {
     s.heavyWorkTotal = heavyWorkTotal_.load();
     s.heavyWorkDone = heavyWorkDone_.load();
     s.processingHeavy = processingHeavy_.load();
+    auto seconds = [](const std::atomic<std::uint64_t>& ns) { return static_cast<double>(ns.load()) / 1e9; };
+    s.timing.counting = seconds(countingNs_);
+    s.timing.walking = seconds(walkingNs_);
+    s.timing.reading = seconds(readingNs_);
+    s.timing.parsing = seconds(parsingNs_);
+    s.timing.writing = seconds(writingNs_);
+    s.timing.saving = seconds(savingNs_);
+    s.timing.upgrading = seconds(upgradingNs_);
+    s.timing.bytesRead = bytesRead_.load();
+    s.timing.textBytes = textBytes_.load();
+    s.timing.filesWithText = filesWithText_.load();
     std::lock_guard<std::mutex> lock(statusMutex_);
     const std::uint64_t activeMs = heavyActiveMs_.load();
     if (s.processingHeavy && activeMs > 0 && s.heavyWorkDone > 0) {
@@ -243,6 +267,8 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
         phase_.store(IndexPhase::Upgrading);
         filesTotal_.store(pending);
         activeWorkers_.store(1);
+        const auto started = Clock::now();
+        const std::uint64_t pausedBefore = pausedNs_.load();
         try {
             while (!cancelled_.load(std::memory_order_relaxed)) {
                 waitWhilePaused();
@@ -255,6 +281,7 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
             // Not fatal: the scan still runs, exact search just stays partial.
             if (indexerOptions_.onFileError) indexerOptions_.onFileError("", e.what());
         }
+        upgradingNs_ += nanosSince(started) - (pausedNs_.load() - pausedBefore);
         activeWorkers_.store(0);
         filesTotal_.store(0);
         filesVisited_.store(0);
@@ -280,6 +307,8 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
         // A metadata-only walk up front so progress can read "N of M". Cheap
         // next to the indexing pass itself, which reads file contents.
         activeWorkers_.store(1);
+        const auto started = Clock::now();
+        const std::uint64_t pausedBefore = pausedNs_.load();
         for (const auto& root : roots) {
             if (cancelled_.load(std::memory_order_relaxed)) break;
             if (!FileScanner::isAccessible(root)) continue;
@@ -295,6 +324,7 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
                 },
                 &cancelled_);
         }
+        countingNs_ += nanosSince(started) - (pausedNs_.load() - pausedBefore);
         activeWorkers_.store(0);
         phase_.store(IndexPhase::Indexing);
     }
@@ -330,11 +360,25 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
             std::string content;
             const std::string ext = toLowerAscii(record.extension);
             if (ContentExtractor::isSupportedExtension(ext)) {
-                if (auto extracted = ContentExtractor::extract(pathFromUtf8(record.path), ext, extractionOptions_)) {
+                ExtractionTiming extraction;
+                const auto started = Clock::now();
+                if (auto extracted =
+                        ContentExtractor::extract(pathFromUtf8(record.path), ext, extractionOptions_, &extraction)) {
                     content = std::move(*extracted);
                 }
+                const std::uint64_t total = nanosSince(started);
+                const auto reading = static_cast<std::uint64_t>(extraction.readSeconds * 1e9);
+                readingNs_ += std::min(reading, total);
+                parsingNs_ += total - std::min(reading, total);
+                bytesRead_ += extraction.bytesRead;
+                if (!content.empty()) {
+                    textBytes_ += content.size();
+                    ++filesWithText_;
+                }
             }
+            const auto writeStarted = Clock::now();
             storage_.upsertFile(record, content);
+            writingNs_ += nanosSince(writeStarted);
         } catch (const std::exception& e) {
             ++filesFailed_;
             ++filesVisited_;
@@ -353,8 +397,10 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
         ++filesVisited_;
         endFile();
         if (countSnapshot % effectiveBatchSize == 0) {
+            const auto saveStarted = Clock::now();
             storage_.commitBatch();
             storage_.beginBatch();
+            savingNs_ += nanosSince(saveStarted);
         }
         if (onProgress) onProgress(IndexProgress{countSnapshot, record.path});
         if (indexerOptions_.ioDelayPerFile.count() > 0) {
@@ -379,9 +425,20 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
                 continue;
             }
 
+            // Listing time is the scan's total minus the time spent in the
+            // visitor below (file processing and any pause).
+            const auto scanStarted = Clock::now();
+            std::uint64_t visitorNs = 0;
             FileScanner::scan(
                 roots[idx], scanOptions_,
                 [&](const FileRecord& record) {
+                    const auto visitStarted = Clock::now();
+                    struct AddElapsed {
+                        std::uint64_t& total;
+                        Clock::time_point start;
+                        ~AddElapsed() { total += nanosSince(start); }
+                    } addElapsed{visitorNs, visitStarted};
+
                     waitWhilePaused();
                     if (cancelled_.load(std::memory_order_relaxed)) return;
                     beginFile(record.path, record.size);
@@ -409,6 +466,8 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
                     processFile(record);
                 },
                 &cancelled_, onUnreadableDirectory);
+            const std::uint64_t scanNs = nanosSince(scanStarted);
+            walkingNs_ += scanNs - std::min(visitorNs, scanNs);
         }
         --activeWorkers_;
     };
@@ -473,12 +532,16 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
         for (const auto& [path, stat] : existingByPath) {
             (void)stat;
             if (visitedPaths.find(path) == visitedPaths.end() && !insideUnreadable(path)) {
+                const auto removeStarted = Clock::now();
                 storage_.removeFile(path);
+                writingNs_ += nanosSince(removeStarted);
             }
         }
     }
 
+    const auto saveStarted = Clock::now();
     storage_.commitBatch();
+    savingNs_ += nanosSince(saveStarted);
 
     const bool wasCancelled = cancelled_.load(std::memory_order_relaxed);
     finishedCancelled_.store(wasCancelled);

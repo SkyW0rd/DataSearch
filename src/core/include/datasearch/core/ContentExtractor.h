@@ -24,6 +24,14 @@ struct ExtractionOptions {
     std::uint64_t maxUnpackedBytes = 512ull * 1024 * 1024;
 };
 
+// Where extraction's time went, for the indexing monitor: reading the file
+// (opening included — on Windows that's also where an antivirus scans it)
+// versus everything else, i.e. parsing.
+struct ExtractionTiming {
+    double readSeconds = 0;
+    std::uint64_t bytesRead = 0;
+};
+
 // Best-effort plain-text extraction for the formats required by ТЗ п.3.1.1:
 //  - plain text / source code: read as-is (UTF-8 assumed).
 //  - .docx: text runs of the body, headers/footers, footnotes/endnotes,
@@ -50,9 +58,11 @@ struct ExtractionOptions {
 class ContentExtractor {
 public:
     static bool isSupportedExtension(const std::string& extensionLowercase);
+    // `timing`, if given, is added to (not reset).
     static std::optional<std::string> extract(const std::filesystem::path& path,
                                                 const std::string& extensionLowercase,
-                                                const ExtractionOptions& options = {});
+                                                const ExtractionOptions& options = {},
+                                                ExtractionTiming* timing = nullptr);
 };
 
 } // namespace datasearch::core

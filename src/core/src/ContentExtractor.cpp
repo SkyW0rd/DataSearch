@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <string_view>
@@ -120,13 +121,33 @@ struct ZipEntry {
     std::uint32_t localHeaderOffset = 0;
 };
 
+// Adds the time until it goes out of scope, and `bytes`, to `timing` (if any).
+class ReadClock {
+public:
+    ReadClock(ExtractionTiming* timing, std::uint64_t bytes = 0)
+        : timing_(timing), bytes_(bytes), start_(std::chrono::steady_clock::now()) {}
+    ~ReadClock() {
+        if (timing_ == nullptr) return;
+        timing_->readSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+        timing_->bytesRead += bytes_;
+    }
+    void setBytes(std::uint64_t bytes) { bytes_ = bytes; }
+
+private:
+    ExtractionTiming* timing_;
+    std::uint64_t bytes_;
+    std::chrono::steady_clock::time_point start_;
+};
+
 // Reads straight from the file by offset rather than loading the whole
 // archive: a DOCX/XLSX is often mostly embedded images (word/media/*,
 // xl/media/*), and only the central directory plus the few XML entries that
 // hold text are ever needed — the image bytes are never read at all.
 class ZipArchive {
 public:
-    bool open(const std::filesystem::path& path) {
+    bool open(const std::filesystem::path& path, ExtractionTiming* timing) {
+        timing_ = timing;
+        ReadClock clock(timing_);
         file_.open(path, std::ios::binary);
         if (!file_) return false;
         file_.seekg(0, std::ios::end);
@@ -221,6 +242,7 @@ public:
 private:
     bool readAt(std::uint64_t offset, std::uint64_t size, std::vector<std::uint8_t>& out) {
         if (offset > fileSize_ || size > fileSize_ - offset) return false;
+        ReadClock clock(timing_, size);
         out.resize(static_cast<std::size_t>(size));
         file_.clear();
         file_.seekg(static_cast<std::streamoff>(offset));
@@ -232,6 +254,7 @@ private:
     std::ifstream file_;
     std::uint64_t fileSize_ = 0;
     std::vector<ZipEntry> entries_;
+    ExtractionTiming* timing_ = nullptr;
 };
 
 std::optional<std::vector<std::uint8_t>> readWholeFile(const std::filesystem::path& path) {
@@ -1280,7 +1303,8 @@ bool ContentExtractor::isSupportedExtension(const std::string& extensionLowercas
 
 std::optional<std::string> ContentExtractor::extract(const std::filesystem::path& path,
                                                        const std::string& extensionLowercase,
-                                                       const ExtractionOptions& options) {
+                                                       const ExtractionOptions& options,
+                                                       ExtractionTiming* timing) {
     std::error_code ec;
     const auto fileSize = std::filesystem::file_size(path, ec);
     if (ec) return std::nullopt;
@@ -1291,7 +1315,7 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
     // however big the file is.
     if (extensionLowercase == ".docx" || extensionLowercase == ".xlsx") {
         ZipArchive archive;
-        if (!archive.open(path)) return std::nullopt;
+        if (!archive.open(path, timing)) return std::nullopt;
         const bool docx = extensionLowercase == ".docx";
 
         std::vector<std::string> parts;
@@ -1356,18 +1380,28 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
     if (fileSize > options.maxBytes) return std::nullopt;
 
     if (extensionLowercase == ".pdf") {
-        auto raw = readWholeFile(path);
+        std::optional<std::vector<std::uint8_t>> raw;
+        {
+            ReadClock clock(timing);
+            raw = readWholeFile(path);
+            if (raw) clock.setBytes(raw->size());
+        }
         if (!raw) return std::nullopt;
         return extractPdfText(*raw);
     }
 
     // Straight into the string that gets returned — not via a byte vector,
     // which would hold a second full copy of a large text file.
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return std::nullopt;
-    std::string text(static_cast<std::size_t>(fileSize), '\0');
-    in.read(text.data(), static_cast<std::streamsize>(text.size()));
-    text.resize(static_cast<std::size_t>(in.gcount()));
+    std::string text;
+    {
+        ReadClock clock(timing);
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return std::nullopt;
+        text.assign(static_cast<std::size_t>(fileSize), '\0');
+        in.read(text.data(), static_cast<std::streamsize>(text.size()));
+        text.resize(static_cast<std::size_t>(in.gcount()));
+        clock.setBytes(text.size());
+    }
     if (text.empty()) return std::nullopt;
     return text;
 }

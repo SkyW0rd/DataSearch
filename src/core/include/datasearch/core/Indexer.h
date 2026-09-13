@@ -87,6 +87,22 @@ struct IndexerStatus {
 
     std::chrono::steady_clock::time_point startedAt;
     std::chrono::steady_clock::time_point finishedAt;
+
+    // Where the run's time went, in seconds, pauses excluded — for the
+    // indexing monitor, to tell a slow disk or antivirus (reading) from CPU
+    // work (parsing, writing).
+    struct Timing {
+        double counting = 0;   // the up-front walk that counts files
+        double walking = 0;    // listing directories during the main pass
+        double reading = 0;    // opening and reading files (where an antivirus scans them)
+        double parsing = 0;    // extracting text from what was read
+        double writing = 0;    // adding files to the index
+        double saving = 0;     // committing batches to disk
+        double upgrading = 0;  // filling the exact-word index of an older index
+        std::uint64_t bytesRead = 0;
+        std::uint64_t textBytes = 0;
+        std::uint64_t filesWithText = 0;
+    } timing;
 };
 
 struct IndexerOptions {
@@ -223,6 +239,19 @@ private:
     std::atomic<std::uint64_t> heavyActiveMs_{0};  // time spent processing finished heavy files
     std::atomic<std::uint64_t> currentWork_{0};     // expected text of the heavy file in flight
     std::atomic<bool> processingHeavy_{false};
+
+    // IndexerStatus::Timing, accumulated in nanoseconds/bytes.
+    std::atomic<std::uint64_t> countingNs_{0};
+    std::atomic<std::uint64_t> walkingNs_{0};
+    std::atomic<std::uint64_t> readingNs_{0};
+    std::atomic<std::uint64_t> parsingNs_{0};
+    std::atomic<std::uint64_t> writingNs_{0};
+    std::atomic<std::uint64_t> savingNs_{0};
+    std::atomic<std::uint64_t> upgradingNs_{0};
+    std::atomic<std::uint64_t> pausedNs_{0};
+    std::atomic<std::uint64_t> bytesRead_{0};
+    std::atomic<std::uint64_t> textBytes_{0};
+    std::atomic<std::uint64_t> filesWithText_{0};
 
     mutable std::mutex statusMutex_;  // guards the fields below
     std::string currentPath_;
