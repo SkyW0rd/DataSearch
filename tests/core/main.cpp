@@ -23,6 +23,7 @@ void runSearchFilterTests();
 void runProblemFilesTests();
 void runIndexerLockedIndexTests();
 void runIndexStorageRemoveUnderTests();
+void runPdfEncryptionTests();
 
 namespace {
 
@@ -55,6 +56,7 @@ int main() {
         {"ProblemFiles", runProblemFilesTests},
         {"IndexerLockedIndex", runIndexerLockedIndexTests},
         {"IndexStorageRemoveUnder", runIndexStorageRemoveUnderTests},
+        {"PdfEncryption", runPdfEncryptionTests},
     };
 
     int failures = 0;

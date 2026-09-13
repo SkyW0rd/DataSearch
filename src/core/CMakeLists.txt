@@ -44,6 +44,7 @@ add_library(datasearch_core STATIC
   src/SourceRegistry.cpp
   src/SearchQueryParser.cpp
   src/NaturalOrder.cpp
+  src/PdfCrypto.cpp
 )
 
 target_include_directories(datasearch_core PUBLIC

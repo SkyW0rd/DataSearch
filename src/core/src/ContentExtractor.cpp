@@ -1,5 +1,7 @@
 #include "datasearch/core/ContentExtractor.h"
 
+#include "datasearch/core/PdfCrypto.h"
+
 #include <zlib.h>
 
 #include <algorithm>
@@ -271,15 +273,6 @@ ExtractionProblem zipOpenProblem(const std::filesystem::path& path) {
         return ExtractionProblem::Protected;
     }
     return ExtractionProblem::Damaged;
-}
-
-// A PDF names its encryption dictionary in the trailer; the header comes
-// first, within the first kilobyte by the spec's leniency.
-ExtractionProblem pdfProblem(const std::vector<std::uint8_t>& raw) {
-    const std::string_view bytes(reinterpret_cast<const char*>(raw.data()), raw.size());
-    if (bytes.substr(0, 1024).find("%PDF") == std::string_view::npos) return ExtractionProblem::Damaged;
-    if (bytes.find("/Encrypt") != std::string_view::npos) return ExtractionProblem::Protected;
-    return ExtractionProblem::None;
 }
 
 std::optional<std::vector<std::uint8_t>> readWholeFile(const std::filesystem::path& path) {
@@ -938,6 +931,7 @@ struct PdfObjectSpan {
     std::uint32_t number = 0;  // the "12" of "12 0 obj", for resolving "12 0 R" references
     std::size_t start = 0;
     std::size_t end = 0;
+    std::uint32_t generation = 0;  // the "0", part of an encrypted object's key
 };
 
 // Finds "<num> <gen> obj" headers without std::regex: MSVC's <regex> engine
@@ -983,7 +977,11 @@ std::vector<PdfObjectSpan> findPdfObjectSpans(std::string_view text) {
         std::size_t digits = numStart;
         if (!readPdfUint(text, digits, number) || digits != numEnd) number = 0;
 
-        spans.push_back({number, numStart, endObj});
+        std::uint32_t generation = 0;
+        std::size_t genDigits = genStart;
+        if (!readPdfUint(text, genDigits, generation) || genDigits != genEnd) generation = 0;
+
+        spans.push_back({number, numStart, endObj, generation});
     }
     return spans;
 }
@@ -1162,7 +1160,156 @@ std::unordered_map<std::string, std::uint32_t> parsePdfFontDictObject(std::strin
     return parsePdfNameRefDict(dictText, open);
 }
 
-std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBytes) {
+// A string value at `i`: "(literal)" or "<hex>".
+std::optional<std::string> readPdfStringValue(std::string_view text, std::size_t i) {
+    if (i >= text.size()) return std::nullopt;
+    if (text[i] == '(') {
+        return consumeLiteralString(std::string(text.substr(i, std::min<std::size_t>(text.size() - i, 4096))), 0).first;
+    }
+    if (text[i] != '<' || (i + 1 < text.size() && text[i + 1] == '<')) return std::nullopt;
+    auto hexValue = [](char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    int high = -1;
+    for (std::size_t j = i + 1; j < text.size() && text[j] != '>'; ++j) {
+        const int v = hexValue(text[j]);
+        if (v < 0) continue;  // whitespace between digits
+        if (high < 0) {
+            high = v;
+        } else {
+            out.push_back(static_cast<char>(high * 16 + v));
+            high = -1;
+        }
+    }
+    if (high >= 0) out.push_back(static_cast<char>(high * 16));
+    return out;
+}
+
+std::optional<long long> readPdfIntValue(std::string_view dictText, std::string_view key) {
+    auto at = findPdfDictKey(dictText, key);
+    if (!at) return std::nullopt;
+    std::size_t i = *at;
+    const bool negative = i < dictText.size() && dictText[i] == '-';
+    if (negative) ++i;
+    const std::size_t start = i;
+    long long value = 0;
+    while (i < dictText.size() && isPdfDigit(dictText[i]) && i - start < 12) value = value * 10 + (dictText[i++] - '0');
+    if (i == start) return std::nullopt;
+    return negative ? -value : value;
+}
+
+// The last whole-key occurrence of `key` (not a longer key it prefixes):
+// in a file with incremental updates, the newest trailer comes last.
+std::size_t findLastPdfKey(std::string_view text, std::string_view key) {
+    std::size_t last = std::string_view::npos;
+    for (std::size_t pos = text.find(key); pos != std::string_view::npos; pos = text.find(key, pos + key.size())) {
+        const std::size_t after = pos + key.size();
+        if (after < text.size() && isPdfWordChar(text[after])) continue;
+        last = pos;
+    }
+    return last;
+}
+
+struct PdfSecurity {
+    bool encrypted = false;
+    std::optional<pdfcrypto::PdfEncryption> encryption;  // set when it opens without a password
+    std::string key;
+};
+
+// The document's encryption, and the key to undo it if the file opens
+// without a password. Strings in the /Encrypt dictionary and the trailer are
+// never encrypted themselves, so they're read as they are.
+PdfSecurity readPdfSecurity(std::string_view text,
+                            const std::unordered_map<std::uint32_t, std::string_view>& dictByObject) {
+    PdfSecurity out;
+    const std::size_t at = findLastPdfKey(text, "/Encrypt");
+    if (at == std::string_view::npos) return out;
+    std::size_t i = at + 8;
+    while (i < text.size() && isPdfSpace(text[i])) ++i;
+    std::string_view dict;
+    std::uint32_t ref = 0;
+    if (text.substr(i, 2) == "<<") {
+        int depth = 0;
+        std::size_t j = i;
+        while (j + 1 < text.size()) {
+            if (text[j] == '<' && text[j + 1] == '<') {
+                ++depth;
+                j += 2;
+            } else if (text[j] == '>' && text[j + 1] == '>') {
+                j += 2;
+                if (--depth == 0) break;
+            } else {
+                ++j;
+            }
+        }
+        dict = text.substr(i, j - i);
+    } else if (readPdfIndirectRef(text, i, ref)) {
+        out.encrypted = true;
+        const auto it = dictByObject.find(ref);
+        if (it == dictByObject.end()) return out;  // encrypted, but how is unknown
+        dict = it->second;
+    } else {
+        return out;  // "/Encrypt" inside some other text, not a trailer entry
+    }
+    out.encrypted = true;
+    if (pdfNameValue(dict, "/Filter") != "Standard") return out;  // certificate-based: needs the recipient's key
+
+    pdfcrypto::PdfEncryption e;
+    e.v = static_cast<int>(readPdfIntValue(dict, "/V").value_or(0));
+    e.r = static_cast<int>(readPdfIntValue(dict, "/R").value_or(0));
+    e.p = static_cast<std::int32_t>(readPdfIntValue(dict, "/P").value_or(0));
+    auto stringFor = [&](std::string_view key) -> std::string {
+        const auto pos = findPdfDictKey(dict, key);
+        if (!pos) return {};
+        return readPdfStringValue(dict, *pos).value_or(std::string());
+    };
+    e.o = stringFor("/O");
+    e.u = stringFor("/U");
+    e.oe = stringFor("/OE");
+    e.ue = stringFor("/UE");
+    if (const auto pos = findPdfDictKey(dict, "/EncryptMetadata")) e.encryptMetadata = dict.substr(*pos, 5) != "false";
+    switch (e.v) {
+        case 1: e.keyBytes = 5; break;
+        case 2: e.keyBytes = static_cast<int>(readPdfIntValue(dict, "/Length").value_or(40) / 8); break;
+        case 4: e.keyBytes = 16; break;
+        case 5: e.keyBytes = 32; break;
+        default: return out;
+    }
+    if (e.v < 4) {
+        e.streamCipher = pdfcrypto::PdfEncryption::Cipher::Rc4;
+    } else if (pdfNameValue(dict, "/StmF") == "Identity") {
+        e.streamCipher = pdfcrypto::PdfEncryption::Cipher::None;
+    } else {
+        const std::string_view method = pdfNameValue(dict, "/CFM");
+        e.streamCipher = method == "AESV2"  ? pdfcrypto::PdfEncryption::Cipher::AesV2
+                         : method == "AESV3" ? pdfcrypto::PdfEncryption::Cipher::AesV3
+                         : method == "None"  ? pdfcrypto::PdfEncryption::Cipher::None
+                         : method == "V2"    ? pdfcrypto::PdfEncryption::Cipher::Rc4
+                         : e.v == 5          ? pdfcrypto::PdfEncryption::Cipher::AesV3
+                                             : pdfcrypto::PdfEncryption::Cipher::Rc4;
+    }
+    // The file identifier: the first string of the newest trailer's /ID.
+    if (const std::size_t id = findLastPdfKey(text, "/ID"); id != std::string_view::npos) {
+        std::size_t j = id + 3;
+        while (j < text.size() && isPdfSpace(text[j])) ++j;
+        if (j < text.size() && text[j] == '[') {
+            ++j;
+            while (j < text.size() && isPdfSpace(text[j])) ++j;
+            e.id = readPdfStringValue(text, j).value_or(std::string());
+        }
+    }
+    if (auto key = pdfcrypto::fileKeyForEmptyPassword(e)) {
+        out.key = std::move(*key);
+        out.encryption = std::move(e);
+    }
+    return out;
+}
+
+std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBytes, ExtractionProblem& why) {
     // A view over the raw bytes, not a copy — with ExtractionOptions::maxBytes
     // raised well past its old 20 MB, copying the whole file here would
     // needlessly double peak memory. Every substring derived below (body,
@@ -1186,13 +1333,32 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
     // the last one wins, which is the revision the trailer points at.
     std::unordered_map<std::uint32_t, std::string_view> dictByObject;
     dictByObject.reserve(objectSpans.size());
+    auto dictOf = [&](const PdfObjectSpan& span) {
+        const std::string_view body = text.substr(span.start, span.end - span.start);
+        const std::size_t streamKw = body.find("stream");
+        return body.substr(0, streamKw == std::string_view::npos ? body.size() : streamKw);
+    };
+    bool sawImage = false;  // no text but pictures: a scan
+    for (const auto& span : objectSpans) {
+        const std::string_view dictText = dictOf(span);
+        dictByObject[span.number] = dictText;
+        sawImage = sawImage || pdfNameValue(dictText, "/Subtype") == "Image";
+    }
+
+    const PdfSecurity security = readPdfSecurity(text, dictByObject);
+    if (security.encrypted && !security.encryption) {
+        why = ExtractionProblem::Protected;
+        return std::nullopt;
+    }
+    const auto* encryption = security.encryption ? &*security.encryption : nullptr;
+    const bool aes = encryption != nullptr && encryption->streamCipher != pdfcrypto::PdfEncryption::Cipher::Rc4 &&
+                     encryption->streamCipher != pdfcrypto::PdfEncryption::Cipher::None;
 
     for (const auto& span : objectSpans) {
         const std::string_view body = text.substr(span.start, span.end - span.start);
         const std::size_t streamKw = body.find("stream");
-        const std::string_view dictText = body.substr(0, streamKw == std::string_view::npos ? body.size() : streamKw);
-        dictByObject[span.number] = dictText;
         if (streamKw == std::string_view::npos) continue;
+        const std::string_view dictText = body.substr(0, streamKw);
 
         std::size_t dataStart = streamKw + 6;
         if (dataStart < body.size() && body[dataStart] == '\r') ++dataStart;
@@ -1201,11 +1367,20 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
         if (endStreamPos == std::string_view::npos || endStreamPos < dataStart) continue;
 
         std::size_t length = endStreamPos - dataStart;
-        if (const auto candidate = parsePdfDirectLength(dictText)) {
-            if (*candidate <= length) length = *candidate;
-        }
-        while (length > 0 && (body[dataStart + length - 1] == '\n' || body[dataStart + length - 1] == '\r')) {
-            --length;
+        const auto declared = parsePdfDirectLength(dictText);
+        const bool exact = declared && *declared <= length;
+        if (exact) length = *declared;
+        if (encryption == nullptr) {
+            while (length > 0 && (body[dataStart + length - 1] == '\n' || body[dataStart + length - 1] == '\r')) {
+                --length;
+            }
+        } else if (!exact) {
+            // Encrypted bytes may well end in what looks like a line break:
+            // without /Length, drop only the one end-of-line before
+            // "endstream", then (AES) round down to whole blocks.
+            if (length > 0 && body[dataStart + length - 1] == '\n') --length;
+            if (length > 0 && body[dataStart + length - 1] == '\r') --length;
+            if (aes) length -= length % 16;
         }
 
         // Images and font programs never yield text, and they are the bulk of
@@ -1214,7 +1389,14 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
         // keeps a picture-heavy PDF from ballooning in RAM.
         if (isNonTextPdfStream(dictText)) continue;
 
-        const std::string_view streamBytes = body.substr(dataStart, length);
+        std::string_view streamBytes = body.substr(dataStart, length);
+        std::string decrypted;
+        if (encryption != nullptr) {
+            auto plain = pdfcrypto::decryptStream(*encryption, security.key, span.number, span.generation, streamBytes);
+            if (!plain) continue;
+            decrypted = std::move(*plain);
+            streamBytes = decrypted;
+        }
         const bool flate = dictText.find("FlateDecode") != std::string_view::npos;
         if (flate) {
             auto decompressed = inflateToString(reinterpret_cast<const unsigned char*>(streamBytes.data()),
@@ -1306,7 +1488,18 @@ std::optional<std::string> extractPdfText(const std::vector<std::uint8_t>& rawBy
         if (isCMapStream(stream.content)) continue;
         result += scanContentStreamText(stream.content, fontsForStream(stream.objectNumber), cmaps);
     }
-    if (result.empty()) return std::nullopt;
+    // Separators alone (one per content stream of a scanned page) aren't text.
+    const bool hasText = std::any_of(result.begin(), result.end(), [](char c) {
+        return c != ' ' && c != '\n' && c != '\r' && c != '\t' && c != '\f' && c != '\v';
+    });
+    if (!hasText) {
+        if (sawImage) {
+            why = ExtractionProblem::ImagesOnly;
+        } else if (text.substr(0, 1024).find("%PDF") == std::string_view::npos) {
+            why = ExtractionProblem::Damaged;  // the header comes within the first kilobyte
+        }
+        return std::nullopt;
+    }
     return result;
 }
 
@@ -1435,16 +1628,7 @@ std::optional<std::string> ContentExtractor::extract(const std::filesystem::path
             why = ExtractionProblem::CannotOpen;
             return std::nullopt;
         }
-        // Encrypted streams (also in PDFs that open without a password but
-        // restrict copying) would decode to garbage, not text.
-        const ExtractionProblem found = pdfProblem(*raw);
-        if (found == ExtractionProblem::Protected) {
-            why = found;
-            return std::nullopt;
-        }
-        auto text = extractPdfText(*raw);
-        if (!text) why = found;
-        return text;
+        return extractPdfText(*raw, why);
     }
 
     // Straight into the string that gets returned — not via a byte vector,

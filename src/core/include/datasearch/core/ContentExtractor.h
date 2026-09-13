@@ -39,9 +39,10 @@ enum class ExtractionProblem {
     None = 0,        // text extracted, or the file simply has none (a scanned PDF)
     CannotOpen = 1,  // couldn't be opened or read: no access, in use, I/O error
     Damaged = 2,     // not a valid file of its type
-    Protected = 3,   // password-protected (encrypted DOCX/XLSX/PDF)
+    Protected = 3,   // needs a password to open (encrypted DOCX/XLSX/PDF)
     TooLarge = 4,    // over the ExtractionOptions limit; text not extracted
     Failed = 5,      // extraction broke off with an error (e.g. out of memory)
+    ImagesOnly = 6,  // a PDF of page images (a scan) with no text layer: only OCR would read it
 };
 
 // Best-effort plain-text extraction for the formats required by ТЗ п.3.1.1:
@@ -63,8 +64,11 @@ enum class ExtractionProblem {
 //    This handles the common case correctly, including documents that use
 //    several different fonts, but can still mismatch a string whose byte
 //    codes happen to resolve under more than one font's CMap.
-//    Encrypted/password-protected PDFs and scanned pages without a text
-//    layer are out of scope (matches ТЗ п.3.1.1).
+//    A PDF encrypted without a password for opening (one that merely
+//    forbids copying or printing) is decrypted — RC4 and AES-128/256, see
+//    PdfCrypto.h — as any viewer does. One that needs a password is
+//    reported as ExtractionProblem::Protected; scanned pages without a text
+//    layer as ExtractionProblem::ImagesOnly.
 // Binary formats with no extractable text return std::nullopt — ТЗ says such
 // files stay indexed by name/metadata only.
 class ContentExtractor {

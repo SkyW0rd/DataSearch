@@ -31,9 +31,9 @@ using namespace display;
 namespace {
 
 // In the order the summary lists them.
-const ExtractionProblem kReasons[] = {ExtractionProblem::Damaged, ExtractionProblem::Protected,
-                                      ExtractionProblem::CannotOpen, ExtractionProblem::TooLarge,
-                                      ExtractionProblem::Failed};
+const ExtractionProblem kReasons[] = {ExtractionProblem::ImagesOnly, ExtractionProblem::Damaged,
+                                      ExtractionProblem::Protected,  ExtractionProblem::CannotOpen,
+                                      ExtractionProblem::TooLarge,   ExtractionProblem::Failed};
 
 QString reasonTitle(ExtractionProblem problem) {
     switch (problem) {
@@ -42,6 +42,7 @@ QString reasonTitle(ExtractionProblem problem) {
         case ExtractionProblem::Protected: return QObject::tr("Защищены паролем");
         case ExtractionProblem::TooLarge: return QObject::tr("Слишком большие");
         case ExtractionProblem::Failed: return QObject::tr("Ошибка при чтении");
+        case ExtractionProblem::ImagesOnly: return QObject::tr("Сканы без текста");
         default: return QObject::tr("Другое");
     }
 }
@@ -55,8 +56,13 @@ QString reasonHint(ExtractionProblem problem) {
             return QObject::tr("Файл повреждён или на самом деле другого формата, чем говорит расширение\n"
                                "(например, старый .doc, переименованный в .docx).");
         case ExtractionProblem::Protected:
-            return QObject::tr("Документ зашифрован. PDF может открываться и без пароля, но запрещать\n"
-                               "копирование — его текст тоже зашифрован.");
+            return QObject::tr("Для открытия нужен пароль — без него текст не прочитать.\n"
+                               "PDF, которые открываются без пароля и только запрещают копирование или печать,\n"
+                               "программа читает сама.");
+        case ExtractionProblem::ImagesOnly:
+            return QObject::tr("Страницы — картинки (скан или фотография), текстового слоя в файле нет.\n"
+                               "По имени такие файлы находятся; чтобы искать по их тексту, нужно распознавание (OCR),\n"
+                               "которого в программе пока нет. Повторная индексация не поможет.");
         case ExtractionProblem::TooLarge:
             return QObject::tr("Текст таких файлов не читается, чтобы не занимать слишком много памяти:\n"
                                "текстовые файлы и PDF больше 100 МБ, документы Word и Excel с текстом больше 512 МБ.\n"
