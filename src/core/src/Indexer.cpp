@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,6 +32,14 @@ using Clock = std::chrono::steady_clock;
 
 std::uint64_t nanosSince(Clock::time_point start) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+}
+
+// ТЗ п.12.3: physical cores minus one (one stays with the writer), 1 to 3.
+// hardware_concurrency() counts logical cores — typically twice the physical.
+std::size_t defaultExtractionThreads() {
+    const unsigned logical = std::thread::hardware_concurrency();
+    const std::size_t physical = logical == 0 ? 2 : std::max<std::size_t>(1, logical / 2);
+    return std::clamp<std::size_t>(physical > 1 ? physical - 1 : 1, 1, 3);
 }
 
 struct FileStat {
@@ -98,6 +108,11 @@ void Indexer::launch(std::vector<std::filesystem::path> roots, ProgressCallback 
         startedAt_ = std::chrono::steady_clock::now();
         finishedAt_ = {};
     }
+    pausedWallNs_.store(0);
+    {
+        std::lock_guard<std::mutex> lock(pauseMutex_);
+        if (paused_.load()) pauseStartedNs_.store(Clock::now().time_since_epoch().count());
+    }
     // Set before the thread exists, so status() right after start() already
     // reports a live run rather than Idle/Finished.
     phase_.store(reconcileMode ? IndexPhase::Indexing : IndexPhase::Counting);
@@ -119,12 +134,17 @@ void Indexer::cancel() {
 
 void Indexer::pause() {
     std::lock_guard<std::mutex> lock(pauseMutex_);
+    if (!paused_.load()) pauseStartedNs_.store(Clock::now().time_since_epoch().count());
     paused_.store(true);
 }
 
 void Indexer::resume() {
     {
         std::lock_guard<std::mutex> lock(pauseMutex_);
+        if (paused_.load()) {
+            pausedWallNs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now().time_since_epoch() - Clock::duration(pauseStartedNs_.load())).count());
+        }
         paused_.store(false);
     }
     pauseCv_.notify_all();
@@ -236,6 +256,14 @@ IndexerStatus Indexer::status() const {
     s.currentStartedAt = currentStartedAt_;
     s.startedAt = startedAt_;
     s.finishedAt = finishedAt_;
+    const auto end = s.phase == IndexPhase::Finished ? finishedAt_ : Clock::now();
+    double pausedSeconds = static_cast<double>(pausedWallNs_.load()) / 1e9;
+    if (s.pauseRequested && s.phase != IndexPhase::Finished) {
+        pausedSeconds += std::chrono::duration<double>(Clock::now().time_since_epoch() -
+                                                       Clock::duration(pauseStartedNs_.load()))
+                             .count();
+    }
+    s.activeSeconds = std::max(0.0, std::chrono::duration<double>(end - startedAt_).count() - pausedSeconds);
     return s;
 }
 
@@ -349,47 +377,65 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
     const std::uint64_t effectiveBatchSize =
         indexerOptions_.batchSize == 0 ? kDefaultBatchSize : indexerOptions_.batchSize;
 
-    // Extracts and stores one file. Runs on a plain std::thread, not a Qt or
-    // main thread — an exception escaping here (a malformed DOCX/PDF
-    // tripping up the hand-rolled parsers, a SQLite error, anything) has no
-    // thread to propagate to and calls std::terminate(), silently killing
-    // the whole app. One bad file must not be able to do that: skip it and
-    // keep indexing the rest.
-    auto processFile = [&](const FileRecord& record) {
+    // Reading/parsing one file and writing it to the index, as two steps so
+    // several files can be read at once while one thread writes. Both run on
+    // plain std::threads, not a Qt or main thread — an exception escaping
+    // (a malformed DOCX/PDF tripping up the hand-rolled parsers, a SQLite
+    // error, anything) has no thread to propagate to and calls
+    // std::terminate(), silently killing the whole app. One bad file must
+    // not be able to do that: it's skipped and indexing goes on.
+    auto extractFile = [&](const FileRecord& record) {
+        Extracted result;
+        result.record = record;
         try {
-            std::string content;
             const std::string ext = toLowerAscii(record.extension);
             if (ContentExtractor::isSupportedExtension(ext)) {
                 ExtractionTiming extraction;
                 const auto started = Clock::now();
                 if (auto extracted =
                         ContentExtractor::extract(pathFromUtf8(record.path), ext, extractionOptions_, &extraction)) {
-                    content = std::move(*extracted);
+                    result.content = std::move(*extracted);
                 }
                 const std::uint64_t total = nanosSince(started);
                 const auto reading = static_cast<std::uint64_t>(extraction.readSeconds * 1e9);
                 readingNs_ += std::min(reading, total);
                 parsingNs_ += total - std::min(reading, total);
                 bytesRead_ += extraction.bytesRead;
-                if (!content.empty()) {
-                    textBytes_ += content.size();
+                if (!result.content.empty()) {
+                    textBytes_ += result.content.size();
                     ++filesWithText_;
                 }
             }
-            const auto writeStarted = Clock::now();
-            storage_.upsertFile(record, content);
-            writingNs_ += nanosSince(writeStarted);
         } catch (const std::exception& e) {
-            ++filesFailed_;
-            ++filesVisited_;
-            endFile();
-            if (indexerOptions_.onFileError) indexerOptions_.onFileError(record.path, e.what());
-            return;
+            result.failed = true;
+            result.error = e.what();
         } catch (...) {
+            result.failed = true;
+            result.error = "unknown error";
+        }
+        return result;
+    };
+
+    auto writeFile = [&](Extracted item) {
+        const FileRecord& record = item.record;
+        if (!item.failed) {
+            try {
+                const auto writeStarted = Clock::now();
+                storage_.upsertFile(record, item.content);
+                writingNs_ += nanosSince(writeStarted);
+            } catch (const std::exception& e) {
+                item.failed = true;
+                item.error = e.what();
+            } catch (...) {
+                item.failed = true;
+                item.error = "unknown error";
+            }
+        }
+        if (item.failed) {
             ++filesFailed_;
             ++filesVisited_;
             endFile();
-            if (indexerOptions_.onFileError) indexerOptions_.onFileError(record.path, "unknown error");
+            if (indexerOptions_.onFileError) indexerOptions_.onFileError(record.path, item.error);
             return;
         }
 
@@ -397,14 +443,94 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
         ++filesVisited_;
         endFile();
         if (countSnapshot % effectiveBatchSize == 0) {
-            const auto saveStarted = Clock::now();
-            storage_.commitBatch();
-            storage_.beginBatch();
-            savingNs_ += nanosSince(saveStarted);
+            try {
+                const auto saveStarted = Clock::now();
+                storage_.commitBatch();
+                storage_.beginBatch();
+                savingNs_ += nanosSince(saveStarted);
+            } catch (const std::exception& e) {
+                if (indexerOptions_.onFileError) indexerOptions_.onFileError(record.path, e.what());
+            }
         }
         if (onProgress) onProgress(IndexProgress{countSnapshot, record.path});
         if (indexerOptions_.ioDelayPerFile.count() > 0) {
             std::this_thread::sleep_for(indexerOptions_.ioDelayPerFile);
+        }
+    };
+
+    auto processFile = [&](const FileRecord& record) { writeFile(extractFile(record)); };
+
+    // The pipeline: walking threads -> files to read -> extraction threads ->
+    // files to write -> one writer. Both queues are bounded (the walk runs
+    // well ahead of reading otherwise, and extracted text is what uses RAM).
+    constexpr std::size_t kMaxQueuedFiles = 4096;
+    constexpr std::size_t kMaxQueuedResults = 256;
+    constexpr std::uint64_t kMaxQueuedText = 64ull * 1024 * 1024;
+    struct Queues {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::deque<FileRecord> toExtract;
+        std::deque<Extracted> toWrite;
+        std::uint64_t toWriteBytes = 0;
+        bool walkDone = false;
+        bool extractDone = false;
+    } q;
+
+    // Waits for `ready`. A thread held up here while a pause is on — behind
+    // parked extraction threads, or starved by a parked walk — counts as
+    // parked too; otherwise the pause would never read as complete.
+    auto waitFor = [&](std::unique_lock<std::mutex>& lock, const auto& ready) {
+        while (!ready() && !cancelled_.load(std::memory_order_relaxed)) {
+            const bool parking = paused_.load(std::memory_order_relaxed);
+            if (parking) ++parkedWorkers_;
+            q.changed.wait_for(lock, std::chrono::milliseconds(50));
+            if (parking) --parkedWorkers_;
+        }
+    };
+
+    auto extractor = [&]() {
+        if (indexerOptions_.onWorkerThreadStart) indexerOptions_.onWorkerThreadStart();
+        ++activeWorkers_;
+        while (true) {
+            waitWhilePaused();
+            FileRecord record;
+            {
+                std::unique_lock<std::mutex> lock(q.mutex);
+                waitFor(lock, [&] { return !q.toExtract.empty() || q.walkDone; });
+                if (cancelled_.load(std::memory_order_relaxed) || q.toExtract.empty()) break;
+                record = std::move(q.toExtract.front());
+                q.toExtract.pop_front();
+            }
+            q.changed.notify_all();
+
+            beginFile(record.path, record.size);
+            Extracted done = extractFile(record);
+            {
+                std::unique_lock<std::mutex> lock(q.mutex);
+                waitFor(lock, [&] { return q.toWrite.size() < kMaxQueuedResults && q.toWriteBytes < kMaxQueuedText; });
+                if (cancelled_.load(std::memory_order_relaxed)) break;
+                q.toWriteBytes += done.content.size();
+                q.toWrite.push_back(std::move(done));
+            }
+            q.changed.notify_all();
+        }
+        --activeWorkers_;
+    };
+
+    auto writer = [&]() {
+        if (indexerOptions_.onWorkerThreadStart) indexerOptions_.onWorkerThreadStart();
+        while (true) {
+            Extracted item;
+            {
+                std::unique_lock<std::mutex> lock(q.mutex);
+                q.changed.wait(lock, [&] { return !q.toWrite.empty() || q.extractDone; });
+                if (q.toWrite.empty()) break;
+                item = std::move(q.toWrite.front());
+                q.toWrite.pop_front();
+                q.toWriteBytes -= item.content.size();
+            }
+            q.changed.notify_all();
+            writeFile(std::move(item));
         }
     };
 
@@ -441,7 +567,6 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
 
                     waitWhilePaused();
                     if (cancelled_.load(std::memory_order_relaxed)) return;
-                    beginFile(record.path, record.size);
 
                     if (reconcileMode) {
                         {
@@ -452,18 +577,22 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
                         if (it != existingByPath.end() && it->second.size == record.size &&
                             it->second.modifiedTime == record.modifiedTime) {
                             ++filesVisited_;
-                            endFile();
                             return;  // unchanged: nothing to do (ТЗ п.13.2)
                         }
                     }
 
                     if (isHeavy(record)) {
-                        endFile();
                         std::lock_guard<std::mutex> lock(deferredMutex);
                         deferred.push_back(record);
                         return;
                     }
-                    processFile(record);
+                    {
+                        std::unique_lock<std::mutex> lock(q.mutex);
+                        waitFor(lock, [&] { return q.toExtract.size() < kMaxQueuedFiles; });
+                        if (cancelled_.load(std::memory_order_relaxed)) return;
+                        q.toExtract.push_back(record);
+                    }
+                    q.changed.notify_all();
                 },
                 &cancelled_, onUnreadableDirectory);
             const std::uint64_t scanNs = nanosSince(scanStarted);
@@ -472,10 +601,29 @@ void Indexer::runInternal(std::vector<std::filesystem::path> roots,
         --activeWorkers_;
     };
 
+    const std::size_t extractorCount =
+        indexerOptions_.extractionThreads == 0 ? defaultExtractionThreads() : indexerOptions_.extractionThreads;
+    std::thread writerThread(writer);
+    std::vector<std::thread> extractors;
+    extractors.reserve(extractorCount);
+    for (std::size_t i = 0; i < extractorCount; ++i) extractors.emplace_back(extractor);
     std::vector<std::thread> workers;
     workers.reserve(threadCount);
     for (std::size_t i = 0; i < threadCount; ++i) workers.emplace_back(worker);
+
     for (auto& t : workers) t.join();
+    {
+        std::lock_guard<std::mutex> lock(q.mutex);
+        q.walkDone = true;
+    }
+    q.changed.notify_all();
+    for (auto& t : extractors) t.join();
+    {
+        std::lock_guard<std::mutex> lock(q.mutex);
+        q.extractDone = true;
+    }
+    q.changed.notify_all();
+    writerThread.join();  // writes whatever was already read, even after a cancel
 
     // Heavy files last, one at a time. The main pass's own list is the
     // authority now: the counting pass's figures were a forecast (and a

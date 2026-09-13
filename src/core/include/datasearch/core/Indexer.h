@@ -87,10 +87,13 @@ struct IndexerStatus {
 
     std::chrono::steady_clock::time_point startedAt;
     std::chrono::steady_clock::time_point finishedAt;
+    // Wall-clock time the run has been going, pauses excluded.
+    double activeSeconds = 0;
 
     // Where the run's time went, in seconds, pauses excluded — for the
     // indexing monitor, to tell a slow disk or antivirus (reading) from CPU
-    // work (parsing, writing).
+    // work (parsing, writing). Summed over threads: with several reading at
+    // once these add up to more than activeSeconds.
     struct Timing {
         double counting = 0;   // the up-front walk that counts files
         double walking = 0;    // listing directories during the main pass
@@ -106,9 +109,15 @@ struct IndexerStatus {
 };
 
 struct IndexerOptions {
-    // Background-indexing parallelism cap (ТЗ п.12.3: "не более
-    // количество_ядер/2, не менее 1 и не более 4"). 0 = pick that default.
+    // How many roots are walked at once (each root's files still go through
+    // the shared extraction threads below). 0 = cores/2, at least 1, at most 4.
     std::size_t threadCount = 0;
+
+    // Threads reading and parsing files at the same time, next to the single
+    // thread writing to the index (ТЗ п.12.3). Reading a file is mostly
+    // waiting — opening it, an antivirus scan, a USB or network round trip —
+    // so several in flight hide that wait. 0 = physical cores - 1, from 1 to 3.
+    std::size_t extractionThreads = 0;
 
     // Records written per SQLite commit. Smaller values commit (and release
     // the batch's in-memory statement/WAL state) more often, trading some
@@ -249,6 +258,9 @@ private:
     std::atomic<std::uint64_t> savingNs_{0};
     std::atomic<std::uint64_t> upgradingNs_{0};
     std::atomic<std::uint64_t> pausedNs_{0};
+    // Wall-clock pause bookkeeping for IndexerStatus::activeSeconds.
+    std::atomic<std::uint64_t> pausedWallNs_{0};
+    std::atomic<std::int64_t> pauseStartedNs_{0};  // steady_clock ticks, while paused_
     std::atomic<std::uint64_t> bytesRead_{0};
     std::atomic<std::uint64_t> textBytes_{0};
     std::atomic<std::uint64_t> filesWithText_{0};
@@ -267,6 +279,14 @@ private:
     void beginFile(const std::string& path, std::uint64_t size);
     void endFile();
     bool isHeavy(const FileRecord& record) const;
+
+    // A file read and parsed, waiting to be written to the index.
+    struct Extracted {
+        FileRecord record;
+        std::string content;
+        bool failed = false;
+        std::string error;
+    };
     void runInternal(std::vector<std::filesystem::path> roots,
                       ProgressCallback onProgress,
                       CompletionCallback onComplete,

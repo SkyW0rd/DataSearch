@@ -79,7 +79,7 @@ QString adviceFor(const IndexerStatus::Timing& t) {
         case 1:
             return QObject::tr(
                        "Больше всего времени (%1%) уходит на разбор документов (PDF, DOCX, XLSX) — это работа "
-                       "процессора. Ускорит обработка документов в нескольких потоках.")
+                       "процессора; документы уже разбираются в нескольких потоках одновременно.")
                 .arg(percent);
         case 2:
             return QObject::tr(
@@ -125,7 +125,7 @@ MonitorDialog::MonitorDialog(IndexManager* manager, QWidget* parent) : QDialog(p
     progressForm->addRow(tr("Время работы:"), activeTime_);
     layout->addWidget(progressBox);
 
-    auto* timeBox = new QGroupBox(tr("Куда уходит время (без учёта пауз)"), this);
+    auto* timeBox = new QGroupBox(tr("Куда уходит время (сумма по всем потокам, без пауз)"), this);
     auto* timeGrid = new QGridLayout(timeBox);
     const QStringList stageNames = {tr("Подсчёт файлов"),         tr("Обход папок"),
                                     tr("Чтение файлов с диска"),  tr("Разбор документов"),
@@ -237,9 +237,10 @@ void MonitorDialog::refresh() {
         sampledAtMs_ = nowMs;
     }
 
+    // Stage times are summed over threads (several files are read at once),
+    // so shares are of that sum; elapsed time and speed use the wall clock.
     const double active =
         t.counting + t.walking + t.reading + t.parsing + t.writing + t.saving + t.upgrading;
-    const double processing = active - t.counting - t.upgrading;
 
     phase_->setText(phaseName(s));
     QString files = tr("%1 из %2%3")
@@ -249,11 +250,11 @@ void MonitorDialog::refresh() {
                                               : QString());
     if (s.reconcile) files += tr(", обновлено %1").arg(formatCount(s.filesWritten));
     files_->setText(files);
-    const double average = processing > 0 ? static_cast<double>(s.filesVisited) / processing : 0;
+    const double average = s.activeSeconds > 0 ? static_cast<double>(s.filesVisited) / s.activeSeconds : 0;
     speed_->setText(tr("сейчас %1 файлов/с, в среднем %2 файлов/с")
                         .arg(formatCount(static_cast<quint64>(filesPerSecond_ + 0.5)),
                              formatCount(static_cast<quint64>(average + 0.5))));
-    activeTime_->setText(formatClock(static_cast<qint64>(active)));
+    activeTime_->setText(formatClock(static_cast<qint64>(s.activeSeconds)));
 
     const std::array<double, 7> values{t.counting, t.walking, t.reading, t.parsing, t.writing, t.saving, t.upgrading};
     for (std::size_t i = 0; i < stages_.size(); ++i) {
